@@ -85,19 +85,14 @@ async fn emit_chat_sends_chat_frame() {
 }
 
 #[tokio::test]
-async fn collect_chat_deltas_requires_terminal_frame() {
+async fn collect_chat_deltas_propagates_error_frames() {
     let (mut caller_end, responder_end) = pipe(8);
     let caller = caller_end.caller();
     let req = Frame::request("llm:chat");
     let mut stream = caller.call(req.clone()).await.unwrap();
     let sender = responder_end.sender();
-    let mut data = Data::new();
-    data.insert("type".into(), "text_delta".into());
-    data.insert("text".into(), "partial".into());
-    let item = req.item(data);
 
-    sender.send(item).await.unwrap();
-    drop(sender);
+    sender.send(req.error("llm exploded")).await.unwrap();
 
     let (tx, _rx) = mpsc::channel(4);
     let upstream = FrameSender::new(tx);
@@ -105,7 +100,7 @@ async fn collect_chat_deltas_requires_terminal_frame() {
         .await
         .unwrap_err();
     assert!(matches!(err, LlmError::InternalCall(_)));
-    assert!(err.to_string().contains("terminal frame"));
+    assert!(err.to_string().contains("llm exploded"));
 }
 
 #[test]
