@@ -74,7 +74,11 @@ pub struct Room {
 impl Room {
     #[must_use]
     pub fn new() -> Self {
-        Self { actors: Vec::new(), history: Vec::new(), next_id: 1 }
+        Self {
+            actors: Vec::new(),
+            history: Vec::new(),
+            next_id: 1,
+        }
     }
 
     /// Append a message to history and return its assigned id.
@@ -91,7 +95,13 @@ impl Room {
         let id = self.next_id;
         self.next_id = self.next_id.checked_add(1).ok_or(RoomError::IdOverflow)?;
         let ts = now_secs();
-        self.history.push(HistoryEntry { id, ts, from: from.into(), content: content.into(), kind });
+        self.history.push(HistoryEntry {
+            id,
+            ts,
+            from: from.into(),
+            content: content.into(),
+            kind,
+        });
         Ok(id)
     }
 
@@ -117,27 +127,5 @@ fn now_secs() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn add_message_increments_id() {
-        let mut room = Room::new();
-        let id1 = room.add_message("user", "hello", HistoryKind::User).unwrap();
-        let id2 = room.add_message("bot", "hi", HistoryKind::Assistant).unwrap();
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-        assert_eq!(room.history.len(), 2);
-    }
-
-    #[test]
-    fn trim_history_removes_oldest() {
-        let mut room = Room::new();
-        for i in 0..5 {
-            room.add_message("user", format!("msg {i}"), HistoryKind::User).unwrap();
-        }
-        room.trim_history(3);
-        assert_eq!(room.history.len(), 3);
-        assert_eq!(room.history[0].content, "msg 2");
-    }
-}
+#[path = "state_test.rs"]
+mod tests;

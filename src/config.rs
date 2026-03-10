@@ -110,8 +110,13 @@ pub fn load_config(path: &Path) -> Result<ConfigFile, LlmError> {
 ///
 /// Returns [`LlmError::ConfigParse`] if the TOML is malformed or missing required fields.
 pub fn parse_config(content: &str) -> Result<ConfigFile, LlmError> {
-    let raw: RawConfig = toml::from_str(content).map_err(|e| LlmError::ConfigParse(e.to_string()))?;
-    Ok(ConfigFile { active: raw.active, configs: raw.configs, traits: raw.traits })
+    let raw: RawConfig =
+        toml::from_str(content).map_err(|e| LlmError::ConfigParse(e.to_string()))?;
+    Ok(ConfigFile {
+        active: raw.active,
+        configs: raw.configs,
+        traits: raw.traits,
+    })
 }
 
 /// Resolve the API key for a profile: literal value takes precedence, then env var.
@@ -127,95 +132,15 @@ pub fn resolve_api_key(profile: &LlmProfile) -> Result<String, LlmError> {
         }
     }
     if profile.api_key_env.trim().is_empty() {
-        return Err(LlmError::MissingApiKey { var: "configs.<name>.api_key_env".to_string() });
+        return Err(LlmError::MissingApiKey {
+            var: "configs.<name>.api_key_env".to_string(),
+        });
     }
-    std::env::var(&profile.api_key_env)
-        .map_err(|_| LlmError::MissingApiKey { var: profile.api_key_env.clone() })
+    std::env::var(&profile.api_key_env).map_err(|_| LlmError::MissingApiKey {
+        var: profile.api_key_env.clone(),
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_minimal_config() {
-        let toml = r#"
-active = "default"
-
-[configs.default]
-provider = "anthropic"
-model = "claude-sonnet-4-6"
-max_tokens = 8096
-api_key_env = "ANTHROPIC_API_KEY"
-self_prompt = "You are a helpful assistant."
-"#;
-        let cfg = parse_config(toml).unwrap();
-        assert_eq!(cfg.active, "default");
-        assert!(cfg.configs.contains_key("default"));
-        assert!(cfg.traits.is_empty());
-    }
-
-    #[test]
-    fn parse_config_with_traits() {
-        let toml = r#"
-active = "default"
-traits = ["ego/senior", "filter/slack"]
-
-[configs.default]
-provider = "anthropic"
-model = "claude-sonnet-4-6"
-max_tokens = 4096
-api_key_env = "ANTHROPIC_API_KEY"
-self_prompt = "Assistant."
-"#;
-        let cfg = parse_config(toml).unwrap();
-        assert_eq!(cfg.traits, vec!["ego/senior", "filter/slack"]);
-    }
-
-    #[test]
-    fn resolve_literal_key() {
-        let profile = LlmProfile {
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-6".to_string(),
-            max_tokens: 4096,
-            api_key_env: String::new(),
-            api_key_value: Some("sk-literal".to_string()),
-            openai_api: None,
-            openai_base_url: None,
-            self_prompt: String::new(),
-        };
-        assert_eq!(resolve_api_key(&profile).unwrap(), "sk-literal");
-    }
-
-    #[test]
-    fn resolve_missing_key_errors() {
-        let profile = LlmProfile {
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-6".to_string(),
-            max_tokens: 4096,
-            api_key_env: "MUNINN_NONEXISTENT_KEY_12345".to_string(),
-            api_key_value: None,
-            openai_api: None,
-            openai_base_url: None,
-            self_prompt: String::new(),
-        };
-        assert!(resolve_api_key(&profile).is_err());
-    }
-
-    #[test]
-    fn parse_openai_api_mode() {
-        let toml = r#"
-active = "default"
-
-[configs.default]
-provider = "openai"
-model = "gpt-4o"
-max_tokens = 4096
-api_key_env = "OPENAI_API_KEY"
-openai_api = "responses"
-self_prompt = "Assistant."
-"#;
-        let cfg = parse_config(toml).unwrap();
-        assert_eq!(cfg.configs["default"].openai_api.as_deref(), Some("responses"));
-    }
-}
+#[path = "config_test.rs"]
+mod tests;

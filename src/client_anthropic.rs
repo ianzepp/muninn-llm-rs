@@ -87,8 +87,14 @@ impl AnthropicClient {
 
         let status = response.status().as_u16();
         if status != 200 {
-            let body_text = response.text().await.map_err(|e| LlmError::ApiRequest(e.to_string()))?;
-            return Err(LlmError::ApiResponse { status, body: body_text });
+            let body_text = response
+                .text()
+                .await
+                .map_err(|e| LlmError::ApiRequest(e.to_string()))?;
+            return Err(LlmError::ApiResponse {
+                status,
+                body: body_text,
+            });
         }
 
         let mut parser = AnthropicStreamParser::default();
@@ -129,7 +135,11 @@ struct AnthropicTool<'a> {
 
 impl<'a> AnthropicTool<'a> {
     fn from_tool(tool: &'a Tool) -> Self {
-        Self { name: &tool.name, description: &tool.description, input_schema: &tool.input_schema }
+        Self {
+            name: &tool.name,
+            description: &tool.description,
+            input_schema: &tool.input_schema,
+        }
     }
 }
 
@@ -163,7 +173,8 @@ impl AnthropicStreamParser {
             if block.is_empty() {
                 continue;
             }
-            let block = std::str::from_utf8(block).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
+            let block =
+                std::str::from_utf8(block).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
             if let Some(delta) = self.parse_block(block)? {
                 deltas.push(delta);
             }
@@ -182,49 +193,90 @@ impl AnthropicStreamParser {
 
         match event_type.as_str() {
             "message_start" => {
-                let v = serde_json::from_str::<Value>(&data).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
+                let v = serde_json::from_str::<Value>(&data)
+                    .map_err(|e| LlmError::StreamDecode(e.to_string()))?;
                 if let Some(m) = v.pointer("/message/model").and_then(Value::as_str) {
                     self.model = m.to_string();
                 }
-                if let Some(t) = v.pointer("/message/usage/input_tokens").and_then(Value::as_u64) {
+                if let Some(t) = v
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                {
                     self.in_tokens = t;
                 }
                 Ok(None)
             }
             "content_block_start" => {
-                let v = serde_json::from_str::<Value>(&data).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
-                let kind = v.pointer("/content_block/type").and_then(Value::as_str).unwrap_or("");
+                let v = serde_json::from_str::<Value>(&data)
+                    .map_err(|e| LlmError::StreamDecode(e.to_string()))?;
+                let kind = v
+                    .pointer("/content_block/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if kind != "tool_use" {
                     return Ok(None);
                 }
-                let index = v.get("index").and_then(Value::as_u64).map_or(0, |n| n as usize);
-                let id = v.pointer("/content_block/id").and_then(Value::as_str).unwrap_or("").to_string();
-                let name = v.pointer("/content_block/name").and_then(Value::as_str).unwrap_or("").to_string();
+                let index = v
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(0);
+                let id = v
+                    .pointer("/content_block/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = v
+                    .pointer("/content_block/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let state = self.tool_states.entry(index).or_default();
-                state.id = id.clone();
-                state.name = name.clone();
-                Ok(Some(ContentDelta::ToolUseDelta { index, id, name, input_fragment: String::new() }))
+                state.id.clone_from(&id);
+                state.name.clone_from(&name);
+                Ok(Some(ContentDelta::ToolUseDelta {
+                    index,
+                    id,
+                    name,
+                    input_fragment: String::new(),
+                }))
             }
             "content_block_delta" => {
-                let v = serde_json::from_str::<Value>(&data).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
-                let delta = match v.get("delta") {
-                    Some(delta) => delta,
-                    None => return Ok(None),
+                let v = serde_json::from_str::<Value>(&data)
+                    .map_err(|e| LlmError::StreamDecode(e.to_string()))?;
+                let Some(delta) = v.get("delta") else {
+                    return Ok(None);
                 };
                 let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
                 match delta_type {
                     "text_delta" => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                        let text = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         Ok(Some(ContentDelta::TextDelta(text)))
                     }
                     "thinking_delta" => {
-                        let thinking = delta.get("thinking").and_then(Value::as_str).unwrap_or("").to_string();
+                        let thinking = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         Ok(Some(ContentDelta::ThinkingDelta(thinking)))
                     }
                     "input_json_delta" => {
-                        let index = v.get("index").and_then(Value::as_u64).map_or(0, |n| n as usize);
+                        let index = v
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .and_then(|n| usize::try_from(n).ok())
+                            .unwrap_or(0);
                         let state = self.tool_states.entry(index).or_default();
-                        let fragment = delta.get("partial_json").and_then(Value::as_str).unwrap_or("").to_string();
+                        let fragment = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         Ok(Some(ContentDelta::ToolUseDelta {
                             index,
                             id: state.id.clone(),
@@ -236,13 +288,17 @@ impl AnthropicStreamParser {
                 }
             }
             "message_delta" => {
-                let v = serde_json::from_str::<Value>(&data).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
+                let v = serde_json::from_str::<Value>(&data)
+                    .map_err(|e| LlmError::StreamDecode(e.to_string()))?;
                 let stop_reason = v
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
                     .unwrap_or("end_turn")
                     .to_string();
-                self.out_tokens = v.pointer("/usage/output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                self.out_tokens = v
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 Ok(Some(ContentDelta::Done {
                     stop_reason,
                     model: self.model.clone(),
@@ -280,7 +336,8 @@ pub fn reconstruct_content_blocks(deltas: &[ContentDelta]) -> (Vec<ContentBlock>
     let mut text_buf = String::new();
     let mut thinking_buf = String::new();
     let mut tool_order: Vec<usize> = Vec::new();
-    let mut tool_states: std::collections::HashMap<usize, ToolBlockState> = std::collections::HashMap::new();
+    let mut tool_states: std::collections::HashMap<usize, ToolBlockState> =
+        std::collections::HashMap::new();
 
     for delta in deltas {
         match delta {
@@ -294,7 +351,12 @@ pub fn reconstruct_content_blocks(deltas: &[ContentDelta]) -> (Vec<ContentBlock>
                 flush_tools(&mut tool_order, &mut tool_states, &mut blocks);
                 thinking_buf.push_str(t);
             }
-            ContentDelta::ToolUseDelta { index, id, name, input_fragment } => {
+            ContentDelta::ToolUseDelta {
+                index,
+                id,
+                name,
+                input_fragment,
+            } => {
                 flush_text(&mut text_buf, &mut blocks);
                 flush_thinking(&mut thinking_buf, &mut blocks);
                 let state = tool_states.entry(*index).or_insert_with(|| {
@@ -302,14 +364,16 @@ pub fn reconstruct_content_blocks(deltas: &[ContentDelta]) -> (Vec<ContentBlock>
                     ToolBlockState::default()
                 });
                 if !id.is_empty() {
-                    state.id = id.clone();
+                    state.id.clone_from(id);
                 }
                 if !name.is_empty() {
-                    state.name = name.clone();
+                    state.name.clone_from(name);
                 }
                 state.input_buf.push_str(input_fragment);
             }
-            ContentDelta::Done { stop_reason: sr, .. } => {
+            ContentDelta::Done {
+                stop_reason: sr, ..
+            } => {
                 stop_reason = Some(sr.clone());
             }
         }
@@ -331,13 +395,17 @@ struct ToolBlockState {
 
 fn flush_text(buf: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !buf.is_empty() {
-        blocks.push(ContentBlock::Text { text: std::mem::take(buf) });
+        blocks.push(ContentBlock::Text {
+            text: std::mem::take(buf),
+        });
     }
 }
 
 fn flush_thinking(buf: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !buf.is_empty() {
-        blocks.push(ContentBlock::Thinking { thinking: std::mem::take(buf) });
+        blocks.push(ContentBlock::Thinking {
+            thinking: std::mem::take(buf),
+        });
     }
 }
 
@@ -347,77 +415,22 @@ fn flush_tools(
     blocks: &mut Vec<ContentBlock>,
 ) {
     for index in std::mem::take(tool_order) {
-        let Some(state) = tool_states.remove(&index) else { continue };
+        let Some(state) = tool_states.remove(&index) else {
+            continue;
+        };
         if state.id.is_empty() {
             continue;
         }
         let input = serde_json::from_str::<Value>(&state.input_buf)
             .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
-        blocks.push(ContentBlock::ToolUse { id: state.id, name: state.name, input });
+        blocks.push(ContentBlock::ToolUse {
+            id: state.id,
+            name: state.name,
+            input,
+        });
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{AnthropicStreamParser, reconstruct_content_blocks};
-    use crate::types::{ContentBlock, ContentDelta};
-
-    #[test]
-    fn parser_keeps_tool_fragments_separate_by_index() {
-        let mut parser = AnthropicStreamParser::default();
-        let chunk = concat!(
-            "event: content_block_start\n",
-            "data: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"lookup\"}}\n\n",
-            "event: content_block_start\n",
-            "data: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_2\",\"name\":\"search\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"b\\\":\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"2}\"}}\n\n"
-        );
-
-        let deltas = parser.push_chunk(chunk.as_bytes()).unwrap();
-        let (blocks, _) = reconstruct_content_blocks(&deltas);
-        assert!(matches!(&blocks[0], ContentBlock::ToolUse { id, .. } if id == "tool_1"));
-        assert!(matches!(&blocks[1], ContentBlock::ToolUse { id, .. } if id == "tool_2"));
-    }
-
-    #[test]
-    fn reconstruct_content_blocks_handles_multiple_tool_indices() {
-        let deltas = vec![
-            ContentDelta::ToolUseDelta {
-                index: 0,
-                id: "tool_1".to_string(),
-                name: "lookup".to_string(),
-                input_fragment: "{\"a\":".to_string(),
-            },
-            ContentDelta::ToolUseDelta {
-                index: 1,
-                id: "tool_2".to_string(),
-                name: "search".to_string(),
-                input_fragment: "{\"b\":".to_string(),
-            },
-            ContentDelta::ToolUseDelta {
-                index: 0,
-                id: "tool_1".to_string(),
-                name: "lookup".to_string(),
-                input_fragment: "1}".to_string(),
-            },
-            ContentDelta::ToolUseDelta {
-                index: 1,
-                id: "tool_2".to_string(),
-                name: "search".to_string(),
-                input_fragment: "2}".to_string(),
-            },
-        ];
-
-        let (blocks, _) = reconstruct_content_blocks(&deltas);
-        assert_eq!(blocks.len(), 2);
-        assert!(matches!(&blocks[0], ContentBlock::ToolUse { id, .. } if id == "tool_1"));
-        assert!(matches!(&blocks[1], ContentBlock::ToolUse { id, .. } if id == "tool_2"));
-    }
-}
+#[path = "client_anthropic_test.rs"]
+mod tests;

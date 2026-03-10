@@ -30,7 +30,7 @@ use muninn_kernel::sender::FrameSender;
 use crate::client_anthropic::reconstruct_content_blocks;
 use crate::error::LlmError;
 use crate::room::state::{Actor, HistoryEntry, HistoryKind};
-use crate::types::{ContentBlock, ContentDelta, Data, Message, Content, Tool};
+use crate::types::{Content, ContentBlock, ContentDelta, Data, Message, Tool};
 
 const MAX_TOOL_ROUNDS: usize = 20;
 
@@ -59,15 +59,24 @@ pub async fn run_actor_loop(
         info!(config = %config, round = round + 1, history = history.len(), context = context.len(), "room: llm round");
 
         let chat_frame = build_chat_frame(config, &history, &context, tools, room)?;
-        let mut stream = caller.call(chat_frame).await.map_err(|e| LlmError::InternalCall(e.to_string()))?;
+        let mut stream = caller
+            .call(chat_frame)
+            .await
+            .map_err(|e| LlmError::InternalCall(e.to_string()))?;
 
         let mut deltas: Vec<ContentDelta> = Vec::new();
 
         // Stream items from llm:chat, forwarding text deltas upstream.
         loop {
-            let Some(frame) = stream.recv().await else { break };
+            let Some(frame) = stream.recv().await else {
+                break;
+            };
             if frame.status == Status::Error {
-                let msg = frame.data.get("message").and_then(|v| v.as_str()).unwrap_or("llm:chat error");
+                let msg = frame
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("llm:chat error");
                 return Err(LlmError::InternalCall(msg.to_string()));
             }
             if frame.status == Status::Done {
@@ -77,11 +86,20 @@ pub async fn run_actor_loop(
                 continue;
             }
 
-            let delta_type = frame.data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let delta_type = frame
+                .data
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             // Forward text deltas upstream immediately for streaming display.
             if delta_type == "text_delta" {
-                let text = frame.data.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let text = frame
+                    .data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if !text.is_empty() {
                     let mut d = Data::new();
                     d.insert("type".into(), "text_delta".into());
@@ -117,23 +135,34 @@ pub async fn run_actor_loop(
             }
             "tool_use" => {
                 // Append assistant turn to context.
-                context.push(Message { role: "assistant".to_string(), content: Content::Blocks(blocks.clone()) });
+                context.push(Message {
+                    role: "assistant".to_string(),
+                    content: Content::Blocks(blocks.clone()),
+                });
 
                 // Dispatch tool calls and collect results.
-                let tool_results = dispatch_tools(caller, &blocks, actors, tools, allowed_prefixes, room).await?;
+                let tool_results =
+                    dispatch_tools(caller, &blocks, actors, tools, allowed_prefixes, room).await?;
                 info!(config = %config, round = round + 1, results = tool_results.len(), "room: tool dispatch done");
 
                 // Append user turn with tool results.
-                context.push(Message { role: "user".to_string(), content: Content::Blocks(tool_results) });
+                context.push(Message {
+                    role: "user".to_string(),
+                    content: Content::Blocks(tool_results),
+                });
             }
             other => {
                 warn!(stop_reason = %other, "room: unknown stop_reason");
-                return Err(LlmError::InternalCall(format!("unknown stop_reason: {other}")));
+                return Err(LlmError::InternalCall(format!(
+                    "unknown stop_reason: {other}"
+                )));
             }
         }
     }
 
-    Err(LlmError::InternalCall(format!("tool loop exceeded {MAX_TOOL_ROUNDS} rounds")))
+    Err(LlmError::InternalCall(format!(
+        "tool loop exceeded {MAX_TOOL_ROUNDS} rounds"
+    )))
 }
 
 // =============================================================================
@@ -150,7 +179,9 @@ async fn dispatch_tools(
 ) -> Result<Vec<ContentBlock>, LlmError> {
     let mut results = Vec::new();
     for block in blocks {
-        let ContentBlock::ToolUse { id, input, .. } = block else { continue };
+        let ContentBlock::ToolUse { id, input, .. } = block else {
+            continue;
+        };
         let outcome = dispatch_one_tool(caller, input, actors, tools, allowed_prefixes, room).await;
         results.push(ContentBlock::ToolResult {
             tool_use_id: id.clone(),
@@ -184,11 +215,17 @@ async fn dispatch_one_tool(
 
     // Block room:* to prevent deadlock, except read-only above.
     if syscall.starts_with("room:") && !room_read_ok {
-        return ToolOutcome::error(format!("forbidden tool syscall (would deadlock): {syscall}"));
+        return ToolOutcome::error(format!(
+            "forbidden tool syscall (would deadlock): {syscall}"
+        ));
     }
 
     // Allowlist check.
-    if !room_read_ok && !allowed_prefixes.iter().any(|p| syscall.starts_with(p.as_str())) {
+    if !room_read_ok
+        && !allowed_prefixes
+            .iter()
+            .any(|p| syscall.starts_with(p.as_str()))
+    {
         return ToolOutcome::error(format!("forbidden tool syscall: {syscall}"));
     }
 
@@ -207,7 +244,11 @@ async fn dispatch_one_tool(
 
     let responses = stream.collect().await;
     if let Some(err) = responses.iter().find(|f| f.status == Status::Error) {
-        let msg = err.data.get("message").and_then(|v| v.as_str()).unwrap_or("syscall failed");
+        let msg = err
+            .data
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("syscall failed");
         return ToolOutcome::error(msg.to_string());
     }
 
@@ -217,8 +258,15 @@ async fn dispatch_one_tool(
         .filter_map(|f| serde_json::to_string(&f.data).ok())
         .collect();
 
-    let content = if items.is_empty() { "ok".to_string() } else { items.join("\n") };
-    ToolOutcome { content, is_error: false }
+    let content = if items.is_empty() {
+        "ok".to_string()
+    } else {
+        items.join("\n")
+    };
+    ToolOutcome {
+        content,
+        is_error: false,
+    }
 }
 
 async fn dispatch_delegate(
@@ -271,7 +319,10 @@ async fn dispatch_delegate(
     ))
     .await
     {
-        Ok(reply) => ToolOutcome { content: reply, is_error: false },
+        Ok(reply) => ToolOutcome {
+            content: reply,
+            is_error: false,
+        },
         Err(e) => ToolOutcome::error(format!("delegate '{role}' failed: {e}")),
     }
 }
@@ -287,7 +338,10 @@ struct ToolOutcome {
 
 impl ToolOutcome {
     fn error(msg: impl Into<String>) -> Self {
-        Self { content: format!("error: {}", msg.into()), is_error: true }
+        Self {
+            content: format!("error: {}", msg.into()),
+            is_error: true,
+        }
     }
 }
 
@@ -373,22 +427,66 @@ fn frame_to_delta(data: &Data) -> Option<ContentDelta> {
     let delta_type = data.get("type").and_then(|v| v.as_str())?;
     match delta_type {
         "thinking_delta" => {
-            let thinking = data.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thinking = data
+                .get("thinking")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             Some(ContentDelta::ThinkingDelta(thinking))
         }
         "tool_use_delta" => {
-            let index = data.get("index").and_then(|v| v.as_u64()).map_or(0, |n| n as usize);
-            let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let input_fragment = data.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Some(ContentDelta::ToolUseDelta { index, id, name, input_fragment })
+            let index = data
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(0);
+            let id = data
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = data
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input_fragment = data
+                .get("input")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(ContentDelta::ToolUseDelta {
+                index,
+                id,
+                name,
+                input_fragment,
+            })
         }
         "done" => {
-            let stop_reason = data.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("end_turn").to_string();
-            let model = data.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let input_tokens = data.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            let output_tokens = data.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            Some(ContentDelta::Done { stop_reason, model, input_tokens, output_tokens })
+            let stop_reason = data
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("end_turn")
+                .to_string();
+            let model = data
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input_tokens = data
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let output_tokens = data
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            Some(ContentDelta::Done {
+                stop_reason,
+                model,
+                input_tokens,
+                output_tokens,
+            })
         }
         _ => None,
     }
@@ -406,14 +504,17 @@ fn build_chat_frame(
         "config".into(),
         serde_json::Value::String(config.to_string()),
     );
-    let history_val = serde_json::to_value(history).map_err(|e| LlmError::Serialize(e.to_string()))?;
+    let history_val =
+        serde_json::to_value(history).map_err(|e| LlmError::Serialize(e.to_string()))?;
     data.insert("history".into(), history_val);
     if !context.is_empty() {
-        let ctx_val = serde_json::to_value(context).map_err(|e| LlmError::Serialize(e.to_string()))?;
+        let ctx_val =
+            serde_json::to_value(context).map_err(|e| LlmError::Serialize(e.to_string()))?;
         data.insert("context".into(), ctx_val);
     }
     if !tools.is_empty() {
-        let tools_val = serde_json::to_value(tools).map_err(|e| LlmError::Serialize(e.to_string()))?;
+        let tools_val =
+            serde_json::to_value(tools).map_err(|e| LlmError::Serialize(e.to_string()))?;
         data.insert("tools".into(), tools_val);
     }
     let mut frame = Frame::request("llm:chat");
@@ -423,62 +524,5 @@ fn build_chat_frame(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use tokio::time::timeout;
-
-    use muninn_kernel::pipe::pipe;
-
-    use super::*;
-
-    async fn recv_frame(pipe: &mut muninn_kernel::PipeEnd) -> Frame {
-        timeout(Duration::from_secs(2), pipe.recv())
-            .await
-            .expect("timed out waiting for frame")
-            .expect("pipe closed unexpectedly")
-    }
-
-    #[tokio::test]
-    async fn emit_broadcasts_sends_thought_and_tool_frames() {
-        let (mut tx_end, mut rx_end) = pipe(8);
-        let caller = tx_end.caller();
-        let blocks = vec![
-            ContentBlock::Thinking { thinking: "Need a tool".to_string() },
-            ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "exec".to_string(),
-                input: serde_json::json!({"syscall":"exec:run","data":{"cmd":"pwd"}}),
-            },
-        ];
-
-        emit_broadcasts(&caller, "general", "bot-1", &blocks).await;
-
-        let thought = recv_frame(&mut rx_end).await;
-        assert_eq!(thought.call, "door:thought");
-        assert_eq!(thought.from.as_deref(), Some("bot-1"));
-        assert_eq!(thought.data.get("room").and_then(|v| v.as_str()), Some("general"));
-        assert_eq!(thought.data.get("content").and_then(|v| v.as_str()), Some("Need a tool"));
-
-        let tool = recv_frame(&mut rx_end).await;
-        assert_eq!(tool.call, "door:tool");
-        assert_eq!(tool.from.as_deref(), Some("bot-1"));
-        assert_eq!(tool.data.get("room").and_then(|v| v.as_str()), Some("general"));
-        assert_eq!(tool.data.get("syscall").and_then(|v| v.as_str()), Some("exec:run"));
-        assert_eq!(tool.data.get("args").and_then(|v| v.get("cmd")).and_then(|v| v.as_str()), Some("pwd"));
-    }
-
-    #[tokio::test]
-    async fn emit_chat_sends_chat_frame() {
-        let (mut tx_end, mut rx_end) = pipe(8);
-        let caller = tx_end.caller();
-
-        emit_chat(&caller, "general", "bot-1", "done").await;
-
-        let chat = recv_frame(&mut rx_end).await;
-        assert_eq!(chat.call, "door:chat");
-        assert_eq!(chat.from.as_deref(), Some("bot-1"));
-        assert_eq!(chat.data.get("room").and_then(|v| v.as_str()), Some("general"));
-        assert_eq!(chat.data.get("content").and_then(|v| v.as_str()), Some("done"));
-    }
-}
+#[path = "message_test.rs"]
+mod tests;

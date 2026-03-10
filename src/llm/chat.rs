@@ -28,7 +28,7 @@ use crate::client_openai::OpenAiClient;
 use crate::config::{ConfigFile, LlmProfile, resolve_api_key};
 use crate::error::LlmError;
 use crate::prompt_bundle::{PromptContext, build_system_prompt};
-use crate::types::{Content, ContentDelta, Data, Message, from_data, ChatRequest};
+use crate::types::{ChatRequest, Content, ContentDelta, Data, Message, from_data};
 
 // =============================================================================
 // PROVIDER CLIENT ENUM
@@ -47,11 +47,18 @@ impl ProviderClient {
             "openai" => {
                 let api_mode = profile.openai_api.as_deref().unwrap_or("chat_completions");
                 if api_mode != "chat_completions" {
-                    return Err(LlmError::ConfigParse(format!("unsupported openai_api: {api_mode}")));
+                    return Err(LlmError::ConfigParse(format!(
+                        "unsupported openai_api: {api_mode}"
+                    )));
                 }
-                Ok(Self::OpenAi(OpenAiClient::new(api_key, profile.openai_base_url.as_deref())?))
+                Ok(Self::OpenAi(OpenAiClient::new(
+                    api_key,
+                    profile.openai_base_url.as_deref(),
+                )?))
             }
-            other => Err(LlmError::ConfigParse(format!("unsupported provider: {other}"))),
+            other => Err(LlmError::ConfigParse(format!(
+                "unsupported provider: {other}"
+            ))),
         }
     }
 
@@ -70,16 +77,22 @@ impl ProviderClient {
     {
         match self {
             Self::Anthropic(client) => {
-                client.stream_chat(model, max_tokens, system_prompt, messages, tools, on_delta).await
+                client
+                    .stream_chat(model, max_tokens, system_prompt, messages, tools, on_delta)
+                    .await
             }
             Self::OpenAi(client) => {
-                client.stream_chat(model, max_tokens, system_prompt, messages, tools, on_delta).await
+                client
+                    .stream_chat(model, max_tokens, system_prompt, messages, tools, on_delta)
+                    .await
             }
         }
     }
 }
 
-pub(crate) fn build_clients(config: &ConfigFile) -> Result<HashMap<String, ProviderClient>, LlmError> {
+pub(crate) fn build_clients(
+    config: &ConfigFile,
+) -> Result<HashMap<String, ProviderClient>, LlmError> {
     let mut clients = HashMap::new();
     for (name, profile) in &config.configs {
         clients.insert(name.clone(), ProviderClient::build(profile)?);
@@ -106,16 +119,22 @@ pub(crate) async fn handle_chat(
     };
 
     let Some(profile) = config.configs.get(&req.config) else {
-        let _ = tx.send_error(&frame, format!("unknown config: {}", req.config)).await;
+        let _ = tx
+            .send_error(&frame, format!("unknown config: {}", req.config))
+            .await;
         return;
     };
 
     let Some(client) = clients.get(&req.config) else {
-        let _ = tx.send_error(&frame, format!("no client for config: {}", req.config)).await;
+        let _ = tx
+            .send_error(&frame, format!("no client for config: {}", req.config))
+            .await;
         return;
     };
 
-    let room = frame.trace.as_ref()
+    let room = frame
+        .trace
+        .as_ref()
         .and_then(|t| t.get("room"))
         .and_then(|r| r.as_str())
         .unwrap_or("");
@@ -141,15 +160,22 @@ pub(crate) async fn handle_chat(
     info!(config = %req.config, room = %room, history = req.history.len(), "llm: chat start");
 
     let stream_result = client
-        .stream_chat(&model, max_tokens, &system_prompt, &messages, tools, |delta| {
-            let item_frame = frame.clone();
-            async move {
-            let data = delta_to_data(&delta);
-            tx.send(item_frame.item(data))
-                .await
-                .map_err(|e| LlmError::PipeSend(e.to_string()))
-            }
-        })
+        .stream_chat(
+            &model,
+            max_tokens,
+            &system_prompt,
+            &messages,
+            tools,
+            |delta| {
+                let item_frame = frame.clone();
+                async move {
+                    let data = delta_to_data(&delta);
+                    tx.send(item_frame.item(data))
+                        .await
+                        .map_err(|e| LlmError::PipeSend(e.to_string()))
+                }
+            },
+        )
         .await;
 
     match stream_result {
@@ -179,14 +205,24 @@ fn delta_to_data(delta: &ContentDelta) -> Data {
             d.insert("type".into(), "thinking_delta".into());
             d.insert("thinking".into(), thinking.clone().into());
         }
-        ContentDelta::ToolUseDelta { index, id, name, input_fragment } => {
+        ContentDelta::ToolUseDelta {
+            index,
+            id,
+            name,
+            input_fragment,
+        } => {
             d.insert("type".into(), "tool_use_delta".into());
             d.insert("index".into(), (*index).into());
             d.insert("id".into(), id.clone().into());
             d.insert("name".into(), name.clone().into());
             d.insert("input".into(), input_fragment.clone().into());
         }
-        ContentDelta::Done { stop_reason, model, input_tokens, output_tokens } => {
+        ContentDelta::Done {
+            stop_reason,
+            model,
+            input_tokens,
+            output_tokens,
+        } => {
             d.insert("type".into(), "done".into());
             d.insert("stop_reason".into(), stop_reason.clone().into());
             d.insert("model".into(), model.clone().into());
@@ -223,71 +259,5 @@ pub fn history_to_messages(history: &[crate::room::state::HistoryEntry]) -> Vec<
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::history_to_messages;
-    use crate::room::state::{HistoryEntry, HistoryKind};
-    use crate::types::{Content, ContentBlock, Message};
-
-    #[test]
-    fn history_to_messages_only_emits_real_turns() {
-        let history = vec![
-            HistoryEntry {
-                id: 1,
-                ts: 100,
-                from: "user".to_string(),
-                content: "hello".to_string(),
-                kind: HistoryKind::User,
-            },
-            HistoryEntry {
-                id: 2,
-                ts: 900,
-                from: "bot".to_string(),
-                content: "hi".to_string(),
-                kind: HistoryKind::Assistant,
-            },
-        ];
-
-        let messages = history_to_messages(&history);
-        assert_eq!(messages.len(), 2);
-        assert!(matches!(&messages[0].content, Content::Text(text) if text == "hello"));
-        assert!(matches!(&messages[1].content, Content::Text(text) if text == "hi"));
-    }
-
-    #[test]
-    fn history_to_messages_keeps_tool_followup_adjacent() {
-        let history = vec![HistoryEntry {
-            id: 1,
-            ts: 100,
-            from: "user".to_string(),
-            content: "solve this".to_string(),
-            kind: HistoryKind::User,
-        }];
-
-        let mut messages = history_to_messages(&history);
-        messages.extend([
-            Message {
-                role: "assistant".to_string(),
-                content: Content::Blocks(vec![ContentBlock::ToolUse {
-                    id: "call_1".to_string(),
-                    name: "lookup".to_string(),
-                    input: json!({"q": "x"}),
-                }]),
-            },
-            Message {
-                role: "user".to_string(),
-                content: Content::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: "ok".to_string(),
-                    is_error: Some(false),
-                }]),
-            },
-        ]);
-
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[2].role, "user");
-        assert!(matches!(&messages[1].content, Content::Blocks(blocks) if matches!(&blocks[0], ContentBlock::ToolUse { .. })));
-        assert!(matches!(&messages[2].content, Content::Blocks(blocks) if matches!(&blocks[0], ContentBlock::ToolResult { .. })));
-    }
-}
+#[path = "chat_test.rs"]
+mod tests;

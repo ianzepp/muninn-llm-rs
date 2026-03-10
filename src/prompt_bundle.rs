@@ -63,13 +63,21 @@ impl Bundle {
     pub fn set(&mut self, slot: Slot, content: impl Into<String>) {
         let text = content.into();
         let trimmed = text.trim();
-        self.slots[slot as usize] = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+        self.slots[slot as usize] = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
     }
 
     /// Join all non-empty slots with double newlines.
     #[must_use]
     pub fn render(self) -> String {
-        self.slots.into_iter().flatten().collect::<Vec<_>>().join("\n\n")
+        self.slots
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -130,17 +138,25 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
 /// field is needed. Unknown names default to the generic assistant context.
 fn render_context_slot(config: &str) -> &'static str {
     match config {
-        "hand" => "## Role: Hand\n\nYou are a specialized worker actor. \
+        "hand" => {
+            "## Role: Hand\n\nYou are a specialized worker actor. \
                    You execute specific tasks delegated by a head actor. \
-                   Be precise, efficient, and return structured results.",
-        "mind" => "## Role: Mind\n\nYou are a research and reasoning actor. \
+                   Be precise, efficient, and return structured results."
+        }
+        "mind" => {
+            "## Role: Mind\n\nYou are a research and reasoning actor. \
                    You analyze problems deeply and produce detailed reports \
-                   for head actors to act on.",
-        "work" => "## Role: Work\n\nYou are a background processing actor. \
-                   You handle long-running or batch tasks autonomously.",
-        _ => "## Role: Assistant\n\nYou are a helpful assistant. \
+                   for head actors to act on."
+        }
+        "work" => {
+            "## Role: Work\n\nYou are a background processing actor. \
+                   You handle long-running or batch tasks autonomously."
+        }
+        _ => {
+            "## Role: Assistant\n\nYou are a helpful assistant. \
               You respond to user messages, use tools when helpful, \
-              and delegate to specialist actors when appropriate.",
+              and delegate to specialist actors when appropriate."
+        }
     }
 }
 
@@ -181,7 +197,11 @@ fn render_environment_slot(room: &str) -> String {
     let mut lines = vec![
         "## Environment".to_string(),
         String::new(),
-        format!("- OS: {} ({})", std::env::consts::OS, std::env::consts::ARCH),
+        format!(
+            "- OS: {} ({})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
         format!("- Room: {room}"),
         String::new(),
     ];
@@ -234,83 +254,5 @@ fn lookup_trait(name: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_slots_are_omitted() {
-        let ctx = PromptContext {
-            config: "default",
-            self_prompt: "I am an assistant.",
-            tools: None,
-            room: "test",
-            description: "",
-            notes: "",
-            memory: "",
-            traits: &[],
-        };
-        let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("Room Description"));
-        assert!(!prompt.contains("Room Notes"));
-        assert!(!prompt.contains("Memory"));
-        assert!(prompt.contains("I am an assistant."));
-        assert!(prompt.contains("Commandments"));
-    }
-
-    #[test]
-    fn tools_slot_populated_when_tools_present() {
-        let tools = vec![Tool {
-            name: "vfs_read".to_string(),
-            description: "Read a file".to_string(),
-            input_schema: serde_json::json!({}),
-        }];
-        let ctx = PromptContext {
-            config: "default",
-            self_prompt: "Assistant.",
-            tools: Some(&tools),
-            room: "test",
-            description: "",
-            notes: "",
-            memory: "",
-            traits: &[],
-        };
-        let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("vfs_read"));
-    }
-
-    #[test]
-    fn memory_slot_populated_when_non_empty() {
-        let ctx = PromptContext {
-            config: "default",
-            self_prompt: "Assistant.",
-            tools: None,
-            room: "test",
-            description: "",
-            notes: "",
-            memory: "User prefers concise answers.",
-            traits: &[],
-        };
-        let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("Memory"));
-        assert!(prompt.contains("User prefers concise answers."));
-    }
-
-    #[test]
-    fn unknown_traits_silently_skipped() {
-        let traits = vec!["unknown/trait".to_string(), "ego/senior".to_string()];
-        let rendered = render_traits(&traits);
-        assert!(rendered.contains("confident"));
-        assert!(!rendered.contains("unknown"));
-    }
-
-    #[test]
-    fn bundle_slot_ordering() {
-        let mut bundle = Bundle::default();
-        bundle.set(Slot::Tone, "Z-tone");
-        bundle.set(Slot::Identity, "A-identity");
-        let rendered = bundle.render();
-        let identity_pos = rendered.find("A-identity").unwrap();
-        let tone_pos = rendered.find("Z-tone").unwrap();
-        assert!(identity_pos < tone_pos, "Identity (slot 0) must precede Tone (slot 9)");
-    }
-}
+#[path = "prompt_bundle_test.rs"]
+mod tests;

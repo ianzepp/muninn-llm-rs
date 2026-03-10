@@ -38,13 +38,20 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(api_key: String, base_url: Option<&str>) -> Result<Self, LlmError> {
-        let base_url = base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/').to_string();
+        let base_url = base_url
+            .unwrap_or(DEFAULT_BASE_URL)
+            .trim_end_matches('/')
+            .to_string();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .build()
             .map_err(|e| LlmError::HttpClientBuild(e.to_string()))?;
-        Ok(Self { http, api_key, base_url })
+        Ok(Self {
+            http,
+            api_key,
+            base_url,
+        })
     }
 
     /// Stream a chat request. Returns collected `ContentDelta` values.
@@ -71,7 +78,9 @@ impl OpenAiClient {
             messages: &cc_messages,
             tools: tool_defs.as_deref(),
             stream: true,
-            stream_options: Some(CcStreamOptions { include_usage: true }),
+            stream_options: Some(CcStreamOptions {
+                include_usage: true,
+            }),
         };
 
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -86,8 +95,14 @@ impl OpenAiClient {
 
         let status = response.status().as_u16();
         if status != 200 {
-            let body_text = response.text().await.map_err(|e| LlmError::ApiRequest(e.to_string()))?;
-            return Err(LlmError::ApiResponse { status, body: body_text });
+            let body_text = response
+                .text()
+                .await
+                .map_err(|e| LlmError::ApiRequest(e.to_string()))?;
+            return Err(LlmError::ApiResponse {
+                status,
+                body: body_text,
+            });
         }
 
         let mut parser = OpenAiStreamParser::default();
@@ -188,12 +203,22 @@ impl<'a> CcToolDef<'a> {
 fn build_cc_messages(system: &str, messages: &[Message]) -> Vec<CcMessage> {
     let mut out = Vec::new();
     if !system.trim().is_empty() {
-        out.push(CcMessage { role: "system".to_string(), content: Some(system.to_string()), tool_calls: None, tool_call_id: None });
+        out.push(CcMessage {
+            role: "system".to_string(),
+            content: Some(system.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
     }
     for msg in messages {
         match &msg.content {
             Content::Text(text) => {
-                out.push(CcMessage { role: msg.role.clone(), content: Some(text.clone()), tool_calls: None, tool_call_id: None });
+                out.push(CcMessage {
+                    role: msg.role.clone(),
+                    content: Some(text.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
             }
             Content::Blocks(blocks) => {
                 let mut text_buf = String::new();
@@ -208,11 +233,16 @@ fn build_cc_messages(system: &str, messages: &[Message]) -> Vec<CcMessage> {
                                 call_type: "function",
                                 function: CcFunction {
                                     name: name.clone(),
-                                    arguments: serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string()),
+                                    arguments: serde_json::to_string(input)
+                                        .unwrap_or_else(|_| "{}".to_string()),
                                 },
                             });
                         }
-                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
                             tool_results.push(CcMessage {
                                 role: "tool".to_string(),
                                 content: Some(content.clone()),
@@ -226,8 +256,16 @@ fn build_cc_messages(system: &str, messages: &[Message]) -> Vec<CcMessage> {
                 if !text_buf.is_empty() || !tool_calls.is_empty() {
                     out.push(CcMessage {
                         role: msg.role.clone(),
-                        content: if text_buf.is_empty() { None } else { Some(text_buf) },
-                        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                        content: if text_buf.is_empty() {
+                            None
+                        } else {
+                            Some(text_buf)
+                        },
+                        tool_calls: if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls)
+                        },
                         tool_call_id: None,
                     });
                 }
@@ -308,7 +346,8 @@ impl OpenAiStreamParser {
     }
 
     fn parse_event(&mut self, data: &str) -> Result<Vec<ContentDelta>, LlmError> {
-        let v = serde_json::from_str::<Value>(data).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
+        let v = serde_json::from_str::<Value>(data)
+            .map_err(|e| LlmError::StreamDecode(e.to_string()))?;
         let mut deltas = Vec::new();
 
         if let Some(m) = v.get("model").and_then(Value::as_str) {
@@ -317,11 +356,18 @@ impl OpenAiStreamParser {
         if let Some(t) = v.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
             self.in_tokens = t;
         }
-        if let Some(t) = v.pointer("/usage/completion_tokens").and_then(Value::as_u64) {
+        if let Some(t) = v
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+        {
             self.out_tokens = t;
         }
 
-        if let Some(choice) = v.get("choices").and_then(Value::as_array).and_then(|a| a.first()) {
+        if let Some(choice) = v
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+        {
             if let Some(delta) = choice.get("delta") {
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
                     if !text.is_empty() {
@@ -331,7 +377,11 @@ impl OpenAiStreamParser {
 
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for (fallback_index, call) in tool_calls.iter().enumerate() {
-                        let index = call.get("index").and_then(Value::as_u64).map_or(fallback_index, |n| n as usize);
+                        let index = call
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .and_then(|n| usize::try_from(n).ok())
+                            .unwrap_or(fallback_index);
                         let state = self.tool_states.entry(index).or_default();
 
                         if let Some(id) = call.get("id").and_then(Value::as_str) {
@@ -341,7 +391,10 @@ impl OpenAiStreamParser {
                             state.name = name.to_string();
                         }
 
-                        let fragment = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
+                        let fragment = call
+                            .pointer("/function/arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         if !state.id.is_empty() || !state.name.is_empty() || !fragment.is_empty() {
                             deltas.push(ContentDelta::ToolUseDelta {
                                 index,
@@ -363,7 +416,10 @@ impl OpenAiStreamParser {
             }
         }
 
-        if v.get("choices").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+        if v.get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
             if let Some(done) = self.take_done() {
                 deltas.push(done);
             }
@@ -373,73 +429,17 @@ impl OpenAiStreamParser {
     }
 
     fn take_done(&mut self) -> Option<ContentDelta> {
-        self.pending_stop_reason.take().map(|stop_reason| ContentDelta::Done {
-            stop_reason,
-            model: self.model.clone(),
-            input_tokens: self.in_tokens,
-            output_tokens: self.out_tokens,
-        })
+        self.pending_stop_reason
+            .take()
+            .map(|stop_reason| ContentDelta::Done {
+                stop_reason,
+                model: self.model.clone(),
+                input_tokens: self.in_tokens,
+                output_tokens: self.out_tokens,
+            })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{OpenAiStreamParser, build_cc_messages};
-    use crate::types::{Content, ContentBlock, ContentDelta, Message};
-
-    #[test]
-    fn build_cc_messages_preserves_tool_result_adjacency() {
-        let messages = vec![
-            Message {
-                role: "assistant".to_string(),
-                content: Content::Blocks(vec![ContentBlock::ToolUse {
-                    id: "call_1".to_string(),
-                    name: "lookup".to_string(),
-                    input: serde_json::json!({"q": "x"}),
-                }]),
-            },
-            Message {
-                role: "user".to_string(),
-                content: Content::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: "ok".to_string(),
-                    is_error: Some(false),
-                }]),
-            },
-        ];
-
-        let out = build_cc_messages("", &messages);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].role, "assistant");
-        assert_eq!(out[1].role, "tool");
-    }
-
-    #[test]
-    fn parser_emits_multiple_tool_calls_and_usage_done() {
-        let mut parser = OpenAiStreamParser::default();
-        let chunk = concat!(
-            "data: {\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"tool_calls\":[",
-            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"a\\\":\"}},",
-            "{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"b\\\":\"}}",
-            "]},\"finish_reason\":null}]}\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
-            "{\"index\":0,\"function\":{\"arguments\":\"1}\"}},",
-            "{\"index\":1,\"function\":{\"arguments\":\"2}\"}}",
-            "]},\"finish_reason\":\"tool_calls\"}]}\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n",
-            "data: [DONE]\n"
-        );
-
-        let deltas = parser.push_chunk(chunk.as_bytes()).unwrap();
-        assert_eq!(deltas.iter().filter(|d| matches!(d, ContentDelta::ToolUseDelta { .. })).count(), 4);
-        let done = deltas
-            .into_iter()
-            .find(|delta| matches!(delta, ContentDelta::Done { .. }))
-            .or_else(|| parser.finish().unwrap())
-            .expect("done delta");
-        assert!(matches!(
-            done,
-            ContentDelta::Done { input_tokens: 11, output_tokens: 7, .. }
-        ));
-    }
-}
+#[path = "client_openai_test.rs"]
+mod tests;
