@@ -2,13 +2,12 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::mpsc;
 use tracing::info;
 
 use muninn_kernel::frame::Frame;
 
 use crate::error::RoomError;
-use crate::room::state::{Actor, HistoryKind, Room};
+use crate::room::state::{Actor, Room};
 use crate::types::Data;
 
 // =============================================================================

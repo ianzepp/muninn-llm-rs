@@ -69,7 +69,7 @@ pub enum ContentDelta {
     TextDelta(String),
     ThinkingDelta(String),
     /// A fragment of a `tool_use` block. `input_fragment` is partial JSON.
-    ToolUseDelta { id: String, name: String, input_fragment: String },
+    ToolUseDelta { index: usize, id: String, name: String, input_fragment: String },
     Done {
         stop_reason: String,
         model: String,

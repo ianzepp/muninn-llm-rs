@@ -23,11 +23,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use muninn_kernel::frame::{ErrorCode, Frame, Status};
+use muninn_kernel::frame::{ErrorCode, Frame};
 use muninn_kernel::pipe::Caller;
 use muninn_kernel::sender::FrameSender;
 use muninn_kernel::syscall::Syscall;
@@ -48,13 +47,12 @@ use crate::types::{Data, Tool};
 /// updates; the async LLM loop runs outside the lock.
 pub struct RoomSyscall {
     rooms: Arc<Mutex<HashMap<String, Room>>>,
-    config: Arc<ConfigFile>,
 }
 
 impl RoomSyscall {
     #[must_use]
-    pub fn new(config: ConfigFile) -> Self {
-        Self { rooms: Arc::new(Mutex::new(HashMap::new())), config: Arc::new(config) }
+    pub fn new(_config: ConfigFile) -> Self {
+        Self { rooms: Arc::new(Mutex::new(HashMap::new())) }
     }
 }
 
@@ -167,7 +165,6 @@ async fn handle_message(
         (actors, history)
     };
 
-    let config = Arc::clone(&syscall.config);
     let rooms = Arc::clone(&syscall.rooms);
     let frame_clone = frame.clone();
     let caller_clone = caller.clone();

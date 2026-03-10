@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -47,19 +48,31 @@ impl OpenAiClient {
     }
 
     /// Stream a chat request. Returns collected `ContentDelta` values.
-    pub async fn stream_chat(
+    pub async fn stream_chat<F, Fut>(
         &self,
         model: &str,
         max_tokens: u32,
         system: &str,
         messages: &[Message],
         tools: Option<&[Tool]>,
-    ) -> Result<Vec<ContentDelta>, LlmError> {
+        mut on_delta: F,
+    ) -> Result<(), LlmError>
+    where
+        F: FnMut(ContentDelta) -> Fut,
+        Fut: std::future::Future<Output = Result<(), LlmError>>,
+    {
         let cc_messages = build_cc_messages(system, messages);
         let tool_defs: Option<Vec<CcToolDef<'_>>> =
             tools.map(|t| t.iter().map(CcToolDef::from_tool).collect());
 
-        let body = CcRequest { model, max_tokens, messages: &cc_messages, tools: tool_defs.as_deref(), stream: true };
+        let body = CcRequest {
+            model,
+            max_tokens,
+            messages: &cc_messages,
+            tools: tool_defs.as_deref(),
+            stream: true,
+            stream_options: Some(CcStreamOptions { include_usage: true }),
+        };
 
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self
@@ -77,8 +90,21 @@ impl OpenAiClient {
             return Err(LlmError::ApiResponse { status, body: body_text });
         }
 
-        let text = response.text().await.map_err(|e| LlmError::ApiRequest(e.to_string()))?;
-        decode_ndjson_text(&text)
+        let mut parser = OpenAiStreamParser::default();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LlmError::ApiRequest(e.to_string()))?;
+            for delta in parser.push_chunk(&chunk)? {
+                on_delta(delta).await?;
+            }
+        }
+
+        if let Some(done) = parser.finish()? {
+            on_delta(done).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -94,6 +120,13 @@ struct CcRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [CcToolDef<'a>]>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<CcStreamOptions>,
+}
+
+#[derive(Serialize)]
+struct CcStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -209,85 +242,204 @@ fn build_cc_messages(system: &str, messages: &[Message]) -> Vec<CcMessage> {
 // NDJSON DECODING
 // =============================================================================
 
-fn decode_ndjson_text(text: &str) -> Result<Vec<ContentDelta>, LlmError> {
-    let mut deltas = Vec::new();
-    let mut model = String::new();
-    let mut in_tokens: u64 = 0;
-    let mut out_tokens: u64 = 0;
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let data = if let Some(rest) = line.strip_prefix("data: ") {
-            rest
-        } else {
-            continue
-        };
-
-        if data == "[DONE]" {
-            break;
-        }
-
-        if let Some(delta) = parse_cc_event(data, &mut model, &mut in_tokens, &mut out_tokens) {
-            deltas.push(delta?);
-        }
-    }
-
-    Ok(deltas)
+#[derive(Default)]
+struct OpenAiStreamParser {
+    buffer: Vec<u8>,
+    model: String,
+    in_tokens: u64,
+    out_tokens: u64,
+    tool_states: std::collections::HashMap<usize, ToolCallState>,
+    pending_stop_reason: Option<String>,
 }
 
-fn parse_cc_event(
-    data: &str,
-    model: &mut String,
-    in_tokens: &mut u64,
-    out_tokens: &mut u64,
-) -> Option<Result<ContentDelta, LlmError>> {
-    let v = serde_json::from_str::<Value>(data).ok()?;
+#[derive(Default)]
+struct ToolCallState {
+    id: String,
+    name: String,
+}
 
-    if let Some(m) = v.get("model").and_then(Value::as_str) {
-        *model = m.to_string();
-    }
-    if let Some(t) = v.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
-        *in_tokens = t;
-    }
-    if let Some(t) = v.pointer("/usage/completion_tokens").and_then(Value::as_u64) {
-        *out_tokens = t;
-    }
+impl OpenAiStreamParser {
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<ContentDelta>, LlmError> {
+        self.buffer.extend_from_slice(chunk);
+        let mut deltas = Vec::new();
 
-    let choice = v.get("choices").and_then(Value::as_array).and_then(|a| a.first())?;
-    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
-    let delta = choice.get("delta")?;
-
-    if let Some(text) = delta.get("content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            return Some(Ok(ContentDelta::TextDelta(text.to_string())));
+        while let Some(line_end) = self.buffer.iter().position(|b| *b == b'\n') {
+            let mut line = self.buffer.drain(..=line_end).collect::<Vec<_>>();
+            if matches!(line.last(), Some(b'\n')) {
+                line.pop();
+            }
+            if matches!(line.last(), Some(b'\r')) {
+                line.pop();
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let line = std::str::from_utf8(&line)
+                .map_err(|e| LlmError::StreamDecode(e.to_string()))?
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            deltas.extend(self.parse_event(data)?);
         }
+
+        Ok(deltas)
     }
 
-    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-        for call in tool_calls {
-            let id = call.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_string();
-            let fragment = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("").to_string();
-            return Some(Ok(ContentDelta::ToolUseDelta { id, name, input_fragment: fragment }));
+    fn finish(&mut self) -> Result<Option<ContentDelta>, LlmError> {
+        if self.buffer.is_empty() {
+            return Ok(self.take_done());
         }
+        let trailing = std::str::from_utf8(&self.buffer)
+            .map_err(|e| LlmError::StreamDecode(e.to_string()))?
+            .trim()
+            .to_string();
+        self.buffer.clear();
+        if trailing.is_empty() || trailing == "data: [DONE]" {
+            return Ok(self.take_done());
+        }
+        Ok(None)
     }
 
-    if let Some(reason) = finish_reason {
-        let stop_reason = match reason {
-            "tool_calls" => "tool_use".to_string(),
-            "length" => "max_tokens".to_string(),
-            _ => "end_turn".to_string(),
-        };
-        return Some(Ok(ContentDelta::Done {
+    fn parse_event(&mut self, data: &str) -> Result<Vec<ContentDelta>, LlmError> {
+        let v = serde_json::from_str::<Value>(data).map_err(|e| LlmError::StreamDecode(e.to_string()))?;
+        let mut deltas = Vec::new();
+
+        if let Some(m) = v.get("model").and_then(Value::as_str) {
+            self.model = m.to_string();
+        }
+        if let Some(t) = v.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
+            self.in_tokens = t;
+        }
+        if let Some(t) = v.pointer("/usage/completion_tokens").and_then(Value::as_u64) {
+            self.out_tokens = t;
+        }
+
+        if let Some(choice) = v.get("choices").and_then(Value::as_array).and_then(|a| a.first()) {
+            if let Some(delta) = choice.get("delta") {
+                if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        deltas.push(ContentDelta::TextDelta(text.to_string()));
+                    }
+                }
+
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    for (fallback_index, call) in tool_calls.iter().enumerate() {
+                        let index = call.get("index").and_then(Value::as_u64).map_or(fallback_index, |n| n as usize);
+                        let state = self.tool_states.entry(index).or_default();
+
+                        if let Some(id) = call.get("id").and_then(Value::as_str) {
+                            state.id = id.to_string();
+                        }
+                        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                            state.name = name.to_string();
+                        }
+
+                        let fragment = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
+                        if !state.id.is_empty() || !state.name.is_empty() || !fragment.is_empty() {
+                            deltas.push(ContentDelta::ToolUseDelta {
+                                index,
+                                id: state.id.clone(),
+                                name: state.name.clone(),
+                                input_fragment: fragment.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.pending_stop_reason = Some(match reason {
+                    "tool_calls" => "tool_use".to_string(),
+                    "length" => "max_tokens".to_string(),
+                    _ => "end_turn".to_string(),
+                });
+            }
+        }
+
+        if v.get("choices").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            if let Some(done) = self.take_done() {
+                deltas.push(done);
+            }
+        }
+
+        Ok(deltas)
+    }
+
+    fn take_done(&mut self) -> Option<ContentDelta> {
+        self.pending_stop_reason.take().map(|stop_reason| ContentDelta::Done {
             stop_reason,
-            model: model.clone(),
-            input_tokens: *in_tokens,
-            output_tokens: *out_tokens,
-        }));
+            model: self.model.clone(),
+            input_tokens: self.in_tokens,
+            output_tokens: self.out_tokens,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OpenAiStreamParser, build_cc_messages};
+    use crate::types::{Content, ContentBlock, ContentDelta, Message};
+
+    #[test]
+    fn build_cc_messages_preserves_tool_result_adjacency() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Content::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    input: serde_json::json!({"q": "x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "ok".to_string(),
+                    is_error: Some(false),
+                }]),
+            },
+        ];
+
+        let out = build_cc_messages("", &messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "assistant");
+        assert_eq!(out[1].role, "tool");
     }
 
-    None
+    #[test]
+    fn parser_emits_multiple_tool_calls_and_usage_done() {
+        let mut parser = OpenAiStreamParser::default();
+        let chunk = concat!(
+            "data: {\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"a\\\":\"}},",
+            "{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"b\\\":\"}}",
+            "]},\"finish_reason\":null}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"function\":{\"arguments\":\"1}\"}},",
+            "{\"index\":1,\"function\":{\"arguments\":\"2}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n",
+            "data: [DONE]\n"
+        );
+
+        let deltas = parser.push_chunk(chunk.as_bytes()).unwrap();
+        assert_eq!(deltas.iter().filter(|d| matches!(d, ContentDelta::ToolUseDelta { .. })).count(), 4);
+        let done = deltas
+            .into_iter()
+            .find(|delta| matches!(delta, ContentDelta::Done { .. }))
+            .or_else(|| parser.finish().unwrap())
+            .expect("done delta");
+        assert!(matches!(
+            done,
+            ContentDelta::Done { input_tokens: 11, output_tokens: 7, .. }
+        ));
+    }
 }

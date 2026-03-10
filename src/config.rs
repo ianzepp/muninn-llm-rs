@@ -53,7 +53,7 @@ pub struct LlmProfile {
     /// Literal API key value (local overrides only, not for VCS).
     #[serde(default)]
     pub api_key_value: Option<String>,
-    /// OpenAI API mode: "chat_completions" or "responses" (default).
+    /// OpenAI API mode. Only "chat_completions" is currently supported.
     #[serde(default)]
     pub openai_api: Option<String>,
     /// OpenAI-compatible base URL (default: https://api.openai.com).
@@ -200,5 +200,22 @@ self_prompt = "Assistant."
             self_prompt: String::new(),
         };
         assert!(resolve_api_key(&profile).is_err());
+    }
+
+    #[test]
+    fn parse_openai_api_mode() {
+        let toml = r#"
+active = "default"
+
+[configs.default]
+provider = "openai"
+model = "gpt-4o"
+max_tokens = 4096
+api_key_env = "OPENAI_API_KEY"
+openai_api = "responses"
+self_prompt = "Assistant."
+"#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.configs["default"].openai_api.as_deref(), Some("responses"));
     }
 }

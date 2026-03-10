@@ -15,6 +15,7 @@
 //! Done (terminal)
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use tracing::info;
@@ -43,8 +44,37 @@ impl ProviderClient {
         let api_key = resolve_api_key(profile)?;
         match profile.provider.as_str() {
             "anthropic" => Ok(Self::Anthropic(AnthropicClient::new(api_key)?)),
-            "openai" => Ok(Self::OpenAi(OpenAiClient::new(api_key, profile.openai_base_url.as_deref())?)),
+            "openai" => {
+                let api_mode = profile.openai_api.as_deref().unwrap_or("chat_completions");
+                if api_mode != "chat_completions" {
+                    return Err(LlmError::ConfigParse(format!("unsupported openai_api: {api_mode}")));
+                }
+                Ok(Self::OpenAi(OpenAiClient::new(api_key, profile.openai_base_url.as_deref())?))
+            }
             other => Err(LlmError::ConfigParse(format!("unsupported provider: {other}"))),
+        }
+    }
+
+    pub(crate) async fn stream_chat<F, Fut>(
+        &self,
+        model: &str,
+        max_tokens: u32,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: Option<&[crate::types::Tool]>,
+        on_delta: F,
+    ) -> Result<(), LlmError>
+    where
+        F: FnMut(ContentDelta) -> Fut,
+        Fut: Future<Output = Result<(), LlmError>>,
+    {
+        match self {
+            Self::Anthropic(client) => {
+                client.stream_chat(model, max_tokens, system_prompt, messages, tools, on_delta).await
+            }
+            Self::OpenAi(client) => {
+                client.stream_chat(model, max_tokens, system_prompt, messages, tools, on_delta).await
+            }
         }
     }
 }
@@ -110,24 +140,23 @@ pub(crate) async fn handle_chat(
 
     info!(config = %req.config, room = %room, history = req.history.len(), "llm: chat start");
 
-    let deltas_result = match client {
-        ProviderClient::Anthropic(c) => c.stream_chat(&model, max_tokens, &system_prompt, &messages, tools).await,
-        ProviderClient::OpenAi(c) => c.stream_chat(&model, max_tokens, &system_prompt, &messages, tools).await,
-    };
+    let stream_result = client
+        .stream_chat(&model, max_tokens, &system_prompt, &messages, tools, |delta| {
+            let item_frame = frame.clone();
+            async move {
+            let data = delta_to_data(&delta);
+            tx.send(item_frame.item(data))
+                .await
+                .map_err(|e| LlmError::PipeSend(e.to_string()))
+            }
+        })
+        .await;
 
-    let deltas = match deltas_result {
-        Ok(d) => d,
+    match stream_result {
+        Ok(()) => {}
         Err(e) => {
             let _ = tx.send_error_from(&frame, &e).await;
             return;
-        }
-    };
-
-    for delta in &deltas {
-        if let Some(data) = delta_to_data(delta) {
-            if tx.send(frame.item(data)).await.is_err() {
-                return;
-            }
         }
     }
 
@@ -139,7 +168,7 @@ pub(crate) async fn handle_chat(
 // DELTA → FRAME DATA
 // =============================================================================
 
-fn delta_to_data(delta: &ContentDelta) -> Option<Data> {
+fn delta_to_data(delta: &ContentDelta) -> Data {
     let mut d = Data::new();
     match delta {
         ContentDelta::TextDelta(text) => {
@@ -150,8 +179,9 @@ fn delta_to_data(delta: &ContentDelta) -> Option<Data> {
             d.insert("type".into(), "thinking_delta".into());
             d.insert("thinking".into(), thinking.clone().into());
         }
-        ContentDelta::ToolUseDelta { id, name, input_fragment } => {
+        ContentDelta::ToolUseDelta { index, id, name, input_fragment } => {
             d.insert("type".into(), "tool_use_delta".into());
+            d.insert("index".into(), (*index).into());
             d.insert("id".into(), id.clone().into());
             d.insert("name".into(), name.clone().into());
             d.insert("input".into(), input_fragment.clone().into());
@@ -164,7 +194,7 @@ fn delta_to_data(delta: &ContentDelta) -> Option<Data> {
             d.insert("output_tokens".into(), (*output_tokens).into());
         }
     }
-    Some(d)
+    d
 }
 
 // =============================================================================

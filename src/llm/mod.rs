@@ -20,13 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
-use uuid::Uuid;
 
-use muninn_kernel::frame::{ErrorCode, Frame, Status};
+use muninn_kernel::frame::{ErrorCode, Frame};
 use muninn_kernel::pipe::Caller;
 use muninn_kernel::sender::FrameSender;
 use muninn_kernel::syscall::Syscall;
@@ -84,11 +80,13 @@ impl Syscall for LlmSyscall {
                 let clients = Arc::clone(&self.clients);
                 let tx_clone = tx.clone();
                 // Spawn so the kernel dispatch loop is not blocked by HTTP.
-                // Cancellation is best-effort: the spawned task checks nothing
-                // itself, but dropping the sender will terminate stream consumers.
-                let _cancel = cancel;
+                // Cancellation is cooperative: dropping the future tears down
+                // the provider stream and stops further frame emission.
                 tokio::spawn(async move {
-                    handle_chat(frame, config, clients, &tx_clone).await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {}
+                        _ = handle_chat(frame, config, clients, &tx_clone) => {}
+                    }
                 });
                 // The spawned task sends Done/Error; we return Ok here so the
                 // kernel does not double-send an error frame.

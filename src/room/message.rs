@@ -29,7 +29,6 @@ use muninn_kernel::sender::FrameSender;
 
 use crate::client_anthropic::reconstruct_content_blocks;
 use crate::error::LlmError;
-use crate::llm::chat::history_to_messages;
 use crate::room::state::{Actor, HistoryEntry, HistoryKind};
 use crate::types::{ContentBlock, ContentDelta, Data, Message, Content, Tool};
 
@@ -327,10 +326,11 @@ fn frame_to_delta(data: &Data) -> Option<ContentDelta> {
             Some(ContentDelta::ThinkingDelta(thinking))
         }
         "tool_use_delta" => {
+            let index = data.get("index").and_then(|v| v.as_u64()).map_or(0, |n| n as usize);
             let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let input_fragment = data.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Some(ContentDelta::ToolUseDelta { id, name, input_fragment })
+            Some(ContentDelta::ToolUseDelta { index, id, name, input_fragment })
         }
         "done" => {
             let stop_reason = data.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("end_turn").to_string();
