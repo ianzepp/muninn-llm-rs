@@ -37,6 +37,58 @@ Primary architectural direction:
 
 ---
 
+## Current Status
+
+Implementation status against this plan:
+
+- Phase 1 is effectively complete: the intended public frame surface is now
+  documented here and matches the current crate shape.
+- Phase 2 is complete: `door:thought`, `door:tool`, and `door:chat` are back in
+  place with tests.
+- Phase 3 is not complete, but a temporary safety measure now exists:
+  same-room `room:message` overlap is blocked by an in-flight guard so causal
+  history corruption cannot occur silently.
+- Phase 4 is in progress:
+  several high-value regression tests now exist, but full room/message
+  pipe-level coverage and cancellation integration coverage are still missing.
+
+The most important remaining architectural step is still the per-room worker
+refactor.
+
+---
+
+## Validated Decisions
+
+These decisions have now been tested or stress-reviewed strongly enough to
+consider them settled unless new evidence appears:
+
+- `door:*` should remain a core library event contract
+- provider streaming must remain incremental end-to-end
+- synthetic chrono `"user"` turns were the wrong design for this crate
+- same-room serialization is required for correctness, not just cleanliness
+- malformed tool payloads must fail explicitly instead of silently degrading
+
+---
+
+## Temporary Compromises
+
+The current implementation contains one deliberate stopgap that should not be
+mistaken for the target architecture:
+
+- same-room message overlap is currently prevented by a room-level in-flight
+  guard that rejects concurrent `room:message` work for the same room
+
+This is acceptable as a correctness barrier, but it is not the intended final
+design.
+
+The target remains:
+
+- per-room worker ownership
+- explicit same-room scheduling semantics
+- cancellation-aware actor lifecycle handling inside the room worker model
+
+---
+
 ## Design Decisions
 
 ### 1. `door:*` is core, not optional
@@ -277,9 +329,10 @@ Do not add yet:
 
 Current state:
 
-- workable prototype
+- workable prototype with correctness hardening
 - direct async dispatch
 - global room map behind mutex
+- temporary same-room in-flight guard to prevent overlap races
 
 Target state:
 
@@ -324,6 +377,7 @@ Testing needs to move closer to `prior`'s pipe-level coverage.
 - room history persistence across messages
 - cancellation during in-flight actor work
 - `door:*` broadcast emission
+- same-room busy/reject behavior until worker serialization lands
 
 ### Required concurrency coverage
 
@@ -350,6 +404,9 @@ Testing needs to move closer to `prior`'s pipe-level coverage.
 Exit criteria:
 - public contracts are written down and match the implementation
 
+Status:
+- complete
+
 ## Phase 2 — Restore `door:*` emissions
 
 - add `door:thought`
@@ -362,6 +419,9 @@ Exit criteria:
 - direct request/response behavior unchanged
 - observers can subscribe to room activity events
 
+Status:
+- complete
+
 ## Phase 3 — Room worker refactor
 
 - replace global mutex room state with per-room workers
@@ -373,6 +433,18 @@ Exit criteria:
 - same-room ordering semantics are explicit
 - multi-room concurrency is improved without history races
 
+Status:
+- not complete
+- current stopgap: same-room overlap is rejected by an in-flight guard
+- next implementation target: replace the guard with per-room workers
+
+Refined checklist:
+- define worker ownership and lifecycle for room creation/removal
+- move room mutation behind worker message passing
+- preserve `room:list`, `room:history`, and membership operations cleanly
+- define whether same-room requests queue or reject while one is active
+- thread cancellation into actor tasks and worker shutdown semantics
+
 ## Phase 4 — Test hardening
 
 - port the strongest `prior` room/message tests
@@ -381,6 +453,22 @@ Exit criteria:
 
 Exit criteria:
 - core ReAct paths and event emissions are covered end-to-end
+
+Status:
+- in progress
+- regression coverage now exists for:
+  - assistant/tool adjacency preservation
+  - OpenAI multi-tool chunks
+  - Anthropic indexed tool reconstruction
+  - malformed Anthropic tool JSON
+  - premature `llm:chat` stream termination handling
+  - same-room overlap guard behavior
+
+Remaining high-value gaps:
+- full pipe-level `room:message` integration tests
+- cancellation propagation tests across room and llm boundaries
+- multi-room concurrency tests
+- broadcast coverage in full message flows, not only helper-level tests
 
 ## Phase 5 — Optional adapter layer
 
@@ -407,8 +495,9 @@ Exit criteria:
 
 The next implementation step should be:
 
-1. add `door:*` emissions and tests
-2. then refactor room ownership to per-room workers
+1. refactor room ownership to per-room workers
+2. then expand pipe-level and cancellation integration coverage
 
-That sequence restores the intended library event surface first, then fixes the
-core room concurrency model under a stronger test harness.
+That sequence replaces the temporary same-room guard with the intended
+architecture, then hardens the new execution model with stronger integration
+tests.
