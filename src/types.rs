@@ -69,7 +69,12 @@ pub enum ContentDelta {
     TextDelta(String),
     ThinkingDelta(String),
     /// A fragment of a `tool_use` block. `input_fragment` is partial JSON.
-    ToolUseDelta { index: usize, id: String, name: String, input_fragment: String },
+    ToolUseDelta {
+        index: usize,
+        id: String,
+        name: String,
+        input_fragment: String,
+    },
     Done {
         stop_reason: String,
         model: String,
@@ -151,7 +156,8 @@ pub type Data = HashMap<String, Value>;
 
 /// Deserialize a typed request from `Frame.data`.
 pub fn from_data<T: serde::de::DeserializeOwned>(data: &Data) -> Result<T, LlmError> {
-    let map: serde_json::Map<String, Value> = data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let map: serde_json::Map<String, Value> =
+        data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     serde_json::from_value(Value::Object(map)).map_err(|e| LlmError::Deserialize(e.to_string()))
 }
 

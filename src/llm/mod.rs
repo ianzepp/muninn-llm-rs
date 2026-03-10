@@ -52,7 +52,10 @@ impl LlmSyscall {
     /// or if the HTTP client cannot be constructed.
     pub fn new(config: ConfigFile) -> Result<Self, LlmError> {
         let clients = build_clients(&config)?;
-        Ok(Self { config: Arc::new(config), clients: Arc::new(clients) })
+        Ok(Self {
+            config: Arc::new(config),
+            clients: Arc::new(clients),
+        })
     }
 }
 
@@ -84,15 +87,17 @@ impl Syscall for LlmSyscall {
                 // the provider stream and stops further frame emission.
                 tokio::spawn(async move {
                     tokio::select! {
-                        _ = cancel.cancelled() => {}
-                        _ = handle_chat(frame, config, clients, &tx_clone) => {}
+                        () = cancel.cancelled() => {}
+                        () = handle_chat(frame, config, clients, &tx_clone) => {}
                     }
                 });
                 // The spawned task sends Done/Error; we return Ok here so the
                 // kernel does not double-send an error frame.
                 Ok(())
             }
-            other => Err(Box::new(LlmError::UnknownConfig { name: format!("unknown llm verb: {other}") })),
+            other => Err(Box::new(LlmError::UnknownConfig {
+                name: format!("unknown llm verb: {other}"),
+            })),
         }
     }
 }

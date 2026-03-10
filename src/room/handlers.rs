@@ -14,21 +14,24 @@ use crate::types::Data;
 // JOIN
 // =============================================================================
 
-pub fn handle_join(
-    rooms: &mut HashMap<String, Room>,
-    frame: &Frame,
-) -> Result<(), RoomError> {
+pub fn handle_join(rooms: &mut HashMap<String, Room>, frame: &Frame) -> Result<(), RoomError> {
     let room_name = room_name(frame)?;
     let actor_name = str_field(&frame.data, "actor_name")?;
     let config = str_field(&frame.data, "config")?;
 
-    let room = rooms.entry(room_name.clone()).or_insert_with(Room::new);
+    let room = rooms.entry(room_name.clone()).or_default();
 
     if room.actors.iter().any(|a| a.name == actor_name) {
-        return Err(RoomError::ActorAlreadyJoined { room: room_name, name: actor_name });
+        return Err(RoomError::ActorAlreadyJoined {
+            room: room_name,
+            name: actor_name,
+        });
     }
 
-    room.actors.push(Actor { name: actor_name.clone(), config });
+    room.actors.push(Actor {
+        name: actor_name.clone(),
+        config,
+    });
     info!(room = %room_name, actor = %actor_name, "room: actor joined");
     Ok(())
 }
@@ -37,10 +40,7 @@ pub fn handle_join(
 // PART
 // =============================================================================
 
-pub fn handle_part(
-    rooms: &mut HashMap<String, Room>,
-    frame: &Frame,
-) -> Result<bool, RoomError> {
+pub fn handle_part(rooms: &mut HashMap<String, Room>, frame: &Frame) -> Result<bool, RoomError> {
     let room_name = room_name(frame)?;
     let actor_name = str_field(&frame.data, "actor_name")?;
 
@@ -51,7 +51,10 @@ pub fn handle_part(
     let before = room.actors.len();
     room.actors.retain(|a| a.name != actor_name);
     if room.actors.len() == before {
-        return Err(RoomError::ActorNotFound { room: room_name, name: actor_name });
+        return Err(RoomError::ActorNotFound {
+            room: room_name,
+            name: actor_name,
+        });
     }
 
     info!(room = %room_name, actor = %actor_name, "room: actor parted");
@@ -66,8 +69,8 @@ pub fn handle_part(
 // HISTORY
 // =============================================================================
 
-pub fn handle_history<'a>(
-    rooms: &'a HashMap<String, Room>,
+pub fn handle_history(
+    rooms: &HashMap<String, Room>,
     frame: &Frame,
 ) -> Result<Vec<Data>, RoomError> {
     let room_name = room_name(frame)?;
@@ -76,12 +79,22 @@ pub fn handle_history<'a>(
         return Err(RoomError::RoomNotFound { room: room_name });
     };
 
-    let limit = frame.data.get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
+    let limit = frame
+        .data
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
 
     let entries: Vec<&crate::room::state::HistoryEntry> = match limit {
-        Some(n) => room.history.iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect(),
+        Some(n) => room
+            .history
+            .iter()
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect(),
         None => room.history.iter().collect(),
     };
 
@@ -118,7 +131,8 @@ pub fn handle_list(rooms: &HashMap<String, Room>) -> Vec<Data> {
 // =============================================================================
 
 fn room_name(frame: &Frame) -> Result<String, RoomError> {
-    frame.data
+    frame
+        .data
         .get("room")
         .and_then(|v| v.as_str())
         .map(str::to_owned)

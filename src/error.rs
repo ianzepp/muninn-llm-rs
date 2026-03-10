@@ -66,7 +66,11 @@ impl ErrorCode for LlmError {
     fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::ApiRequest(_) | Self::ApiResponse { status: 429 | 500..=599, .. }
+            Self::ApiRequest(_)
+                | Self::ApiResponse {
+                    status: 429 | 500..=599,
+                    ..
+                }
         )
     }
 }

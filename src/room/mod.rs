@@ -15,9 +15,9 @@
 //! - `room:list`    — stream active room names
 //! - `room:message` — user message → streaming ReAct loop → reply items
 
-pub mod state;
 mod handlers;
 mod message;
+pub mod state;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -52,7 +52,9 @@ pub struct RoomSyscall {
 impl RoomSyscall {
     #[must_use]
     pub fn new(_config: ConfigFile) -> Self {
-        Self { rooms: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            rooms: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -80,7 +82,9 @@ impl Syscall for RoomSyscall {
                     handlers::handle_join(&mut rooms, frame)
                 };
                 result.map_err(box_err)?;
-                tx.send_done(frame).await.map_err(|e| box_msg(e.to_string()))?;
+                tx.send_done(frame)
+                    .await
+                    .map_err(|e| box_msg(e.to_string()))?;
                 Ok(())
             }
             "part" => {
@@ -89,7 +93,9 @@ impl Syscall for RoomSyscall {
                     handlers::handle_part(&mut rooms, frame)
                 };
                 result.map_err(box_err)?;
-                tx.send_done(frame).await.map_err(|e| box_msg(e.to_string()))?;
+                tx.send_done(frame)
+                    .await
+                    .map_err(|e| box_msg(e.to_string()))?;
                 Ok(())
             }
             "history" => {
@@ -99,9 +105,13 @@ impl Syscall for RoomSyscall {
                 };
                 let items = items.map_err(box_err)?;
                 for data in items {
-                    tx.send(frame.item(data)).await.map_err(|e| box_msg(e.to_string()))?;
+                    tx.send(frame.item(data))
+                        .await
+                        .map_err(|e| box_msg(e.to_string()))?;
                 }
-                tx.send_done(frame).await.map_err(|e| box_msg(e.to_string()))?;
+                tx.send_done(frame)
+                    .await
+                    .map_err(|e| box_msg(e.to_string()))?;
                 Ok(())
             }
             "list" => {
@@ -110,17 +120,17 @@ impl Syscall for RoomSyscall {
                     handlers::handle_list(&rooms)
                 };
                 for data in items {
-                    tx.send(frame.item(data)).await.map_err(|e| box_msg(e.to_string()))?;
+                    tx.send(frame.item(data))
+                        .await
+                        .map_err(|e| box_msg(e.to_string()))?;
                 }
-                tx.send_done(frame).await.map_err(|e| box_msg(e.to_string()))?;
+                tx.send_done(frame)
+                    .await
+                    .map_err(|e| box_msg(e.to_string()))?;
                 Ok(())
             }
-            "message" => {
-                handle_message(self, frame, tx, caller).await
-            }
-            other => {
-                Err(box_msg(format!("unknown room verb: {other}")))
-            }
+            "message" => handle_message(self, frame, tx, caller).await,
+            other => Err(box_msg(format!("unknown room verb: {other}"))),
         }
     }
 }
@@ -139,13 +149,19 @@ async fn handle_message(
     let from = str_field(&frame.data, "from").map_err(box_err)?;
     let content = str_field(&frame.data, "content").map_err(box_err)?;
 
-    let allowed_prefixes: Vec<String> = frame.data
+    let allowed_prefixes: Vec<String> = frame
+        .data
         .get("tool_prefixes")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let tools: Vec<Tool> = frame.data
+    let tools: Vec<Tool> = frame
+        .data
         .get("tools")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
@@ -153,7 +169,7 @@ async fn handle_message(
     // Snapshot state needed for the loop — hold lock briefly.
     let (actors, history) = {
         let mut rooms = lock_rooms(&syscall.rooms);
-        let room = rooms.entry(room_name.clone()).or_insert_with(Room::new);
+        let room = rooms.entry(room_name.clone()).or_default();
 
         // Store the user message in history.
         if let Err(e) = room.add_message(&from, &content, HistoryKind::User) {
@@ -219,7 +235,10 @@ async fn handle_message(
         }
     }
 
-    tx_clone.send_done(&frame_clone).await.map_err(|e| box_msg(e.to_string()))?;
+    tx_clone
+        .send_done(&frame_clone)
+        .await
+        .map_err(|e| box_msg(e.to_string()))?;
     Ok(())
 }
 
@@ -227,8 +246,12 @@ async fn handle_message(
 // HELPERS
 // =============================================================================
 
-fn lock_rooms(rooms: &Arc<Mutex<HashMap<String, Room>>>) -> std::sync::MutexGuard<'_, HashMap<String, Room>> {
-    rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock_rooms(
+    rooms: &Arc<Mutex<HashMap<String, Room>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, Room>> {
+    rooms
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn str_field(data: &Data, key: &str) -> Result<String, RoomError> {
