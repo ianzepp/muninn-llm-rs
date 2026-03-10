@@ -532,6 +532,7 @@ dependencies = [
 [[package]]
 name = "muninn-kernel"
 version = "0.1.0"
+source = "git+https://github.com/ianzepp/muninn-kernel-rs#c02574208631bc6376074d5331a3d0f77b440a54"
 dependencies = [
  "async-trait",
  "serde",
