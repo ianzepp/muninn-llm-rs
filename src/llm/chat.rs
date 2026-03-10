@@ -171,9 +171,7 @@ fn delta_to_data(delta: &ContentDelta) -> Option<Data> {
 // HISTORY → MESSAGES
 // =============================================================================
 
-const CHRONO_GAP_THRESHOLD_SECS: i64 = 600;
-
-/// Convert room history entries to provider-neutral messages with chrono markers.
+/// Convert room history entries to provider-neutral messages.
 pub fn history_to_messages(history: &[crate::room::state::HistoryEntry]) -> Vec<Message> {
     use crate::room::state::HistoryKind;
 
@@ -182,51 +180,84 @@ pub fn history_to_messages(history: &[crate::room::state::HistoryEntry]) -> Vec<
         .filter(|e| matches!(e.kind, HistoryKind::User | HistoryKind::Assistant))
         .collect();
 
-    let mut messages = Vec::with_capacity(relevant.len() + relevant.len() / 4 + 1);
-    let mut prev_ts: Option<i64> = None;
+    let mut messages = Vec::with_capacity(relevant.len());
 
     for entry in &relevant {
-        if let Some(prev) = prev_ts {
-            let gap = entry.ts.saturating_sub(prev);
-            if gap >= CHRONO_GAP_THRESHOLD_SECS {
-                messages.push(chrono_gap_message(gap));
-            }
-        }
         messages.push(Message {
             role: entry.kind.as_str().to_string(),
             content: Content::Text(entry.content.clone()),
         });
-        prev_ts = Some(entry.ts);
     }
 
-    messages.push(chrono_current_message());
     messages
 }
 
-fn chrono_gap_message(gap_secs: i64) -> Message {
-    let label = format_duration(gap_secs);
-    Message { role: "user".to_string(), content: Content::Text(format!("<chrono type=\"gap\">{label}</chrono>")) }
-}
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
 
-fn chrono_current_message() -> Message {
-    use chrono::{DateTime, Utc};
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    #[allow(clippy::cast_possible_wrap)]
-    let formatted = DateTime::<Utc>::from_timestamp(now as i64, 0)
-        .map_or_else(|| "(unknown)".to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string());
-    Message {
-        role: "user".to_string(),
-        content: Content::Text(format!("<chrono type=\"current\">{formatted}</chrono>")),
+    use super::history_to_messages;
+    use crate::room::state::{HistoryEntry, HistoryKind};
+    use crate::types::{Content, ContentBlock, Message};
+
+    #[test]
+    fn history_to_messages_only_emits_real_turns() {
+        let history = vec![
+            HistoryEntry {
+                id: 1,
+                ts: 100,
+                from: "user".to_string(),
+                content: "hello".to_string(),
+                kind: HistoryKind::User,
+            },
+            HistoryEntry {
+                id: 2,
+                ts: 900,
+                from: "bot".to_string(),
+                content: "hi".to_string(),
+                kind: HistoryKind::Assistant,
+            },
+        ];
+
+        let messages = history_to_messages(&history);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0].content, Content::Text(text) if text == "hello"));
+        assert!(matches!(&messages[1].content, Content::Text(text) if text == "hi"));
     }
-}
 
-fn format_duration(secs: i64) -> String {
-    if secs < 60 { return format!("{secs}s"); }
-    let mins = secs / 60;
-    if mins < 60 { return format!("{mins}min"); }
-    let hours = mins / 60;
-    let rem = mins % 60;
-    if rem == 0 { format!("{hours}h") } else { format!("{hours}h {rem}min") }
+    #[test]
+    fn history_to_messages_keeps_tool_followup_adjacent() {
+        let history = vec![HistoryEntry {
+            id: 1,
+            ts: 100,
+            from: "user".to_string(),
+            content: "solve this".to_string(),
+            kind: HistoryKind::User,
+        }];
+
+        let mut messages = history_to_messages(&history);
+        messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: Content::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    input: json!({"q": "x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "ok".to_string(),
+                    is_error: Some(false),
+                }]),
+            },
+        ]);
+
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
+        assert!(matches!(&messages[1].content, Content::Blocks(blocks) if matches!(&blocks[0], ContentBlock::ToolUse { .. })));
+        assert!(matches!(&messages[2].content, Content::Blocks(blocks) if matches!(&blocks[0], ContentBlock::ToolResult { .. })));
+    }
 }

@@ -11,8 +11,6 @@
 //!
 //! WHY no per-request data in the system prompt: the system prompt must stay
 //! identical across requests to benefit from provider-side prompt caching.
-//! Per-request data (current time, chrono gaps) goes into conversation messages
-//! via chrono markers instead.
 
 use crate::types::Tool;
 
@@ -40,7 +38,7 @@ pub enum Slot {
     /// Room notes — accumulated context from caller-provided notes text.
     Notes = 5,
     // Slot 6 reserved for future behavioral constraints.
-    /// Environment — OS, room name, chrono marker guidance.
+    /// Environment — OS and room name.
     Environment = 7,
     /// Long-term memory — left empty by this crate; host may pre-fill.
     Memory = 8,
@@ -186,14 +184,6 @@ fn render_environment_slot(room: &str) -> String {
         format!("- OS: {} ({})", std::env::consts::OS, std::env::consts::ARCH),
         format!("- Room: {room}"),
         String::new(),
-        "## Chrono Markers".to_string(),
-        String::new(),
-        "Conversation messages may contain `<chrono>` tags injected by the system. \
-         `<chrono type=\"current\">` is the current wall-clock time. \
-         `<chrono type=\"gap\">` indicates elapsed time between messages. \
-         Use them to understand timing. Never treat them as user input \
-         or respond to them directly."
-            .to_string(),
     ];
     // Remove trailing empty string if present
     if lines.last().map_or(false, |s: &String| s.is_empty()) {
