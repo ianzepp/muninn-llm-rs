@@ -106,10 +106,12 @@ pub async fn run_actor_loop(
         let stop_reason = stop_reason_opt.as_deref().unwrap_or("end_turn");
 
         info!(config = %config, round = round + 1, stop_reason = %stop_reason, blocks = blocks.len(), "room: llm round result");
+        emit_broadcasts(caller, room, actor_name, &blocks).await;
 
         match stop_reason {
             "end_turn" | "max_tokens" => {
                 let text = extract_text(&blocks);
+                emit_chat(caller, room, actor_name, &text).await;
                 emit_reply(upstream, req_frame, room, actor_name, &text).await;
                 return Ok(text);
             }
@@ -300,6 +302,55 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .join("")
 }
 
+async fn emit_broadcasts(caller: &Caller, room: &str, actor_name: &str, blocks: &[ContentBlock]) {
+    for block in blocks {
+        match block {
+            ContentBlock::Thinking { thinking } => {
+                let frame = Frame::request("door:thought")
+                    .with_from(actor_name)
+                    .with_trace(serde_json::json!({ "room": room }))
+                    .with_data("room", room.into())
+                    .with_data("content", thinking.clone().into());
+                if let Err(err) = caller.send(frame).await {
+                    info!(error = %err, "room: failed to emit door:thought");
+                }
+            }
+            ContentBlock::ToolUse { input, name, .. } => {
+                let syscall = input
+                    .get("syscall")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(name.as_str());
+                let mut frame = Frame::request("door:tool")
+                    .with_from(actor_name)
+                    .with_trace(serde_json::json!({ "room": room }))
+                    .with_data("room", room.into())
+                    .with_data("syscall", syscall.into());
+                if let Some(args) = input.get("data").cloned() {
+                    frame = frame.with_data("args", args);
+                }
+                if let Err(err) = caller.send(frame).await {
+                    info!(error = %err, "room: failed to emit door:tool");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn emit_chat(caller: &Caller, room: &str, actor_name: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let frame = Frame::request("door:chat")
+        .with_from(actor_name)
+        .with_trace(serde_json::json!({ "room": room }))
+        .with_data("room", room.into())
+        .with_data("content", text.into());
+    if let Err(err) = caller.send(frame).await {
+        info!(error = %err, "room: failed to emit door:chat");
+    }
+}
+
 async fn emit_reply(
     upstream: &FrameSender,
     req_frame: &Frame,
@@ -369,4 +420,65 @@ fn build_chat_frame(
     frame.data = data;
     frame.trace = Some(serde_json::json!({ "room": room }));
     Ok(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use muninn_kernel::pipe::pipe;
+
+    use super::*;
+
+    async fn recv_frame(pipe: &mut muninn_kernel::PipeEnd) -> Frame {
+        timeout(Duration::from_secs(2), pipe.recv())
+            .await
+            .expect("timed out waiting for frame")
+            .expect("pipe closed unexpectedly")
+    }
+
+    #[tokio::test]
+    async fn emit_broadcasts_sends_thought_and_tool_frames() {
+        let (mut tx_end, mut rx_end) = pipe(8);
+        let caller = tx_end.caller();
+        let blocks = vec![
+            ContentBlock::Thinking { thinking: "Need a tool".to_string() },
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "exec".to_string(),
+                input: serde_json::json!({"syscall":"exec:run","data":{"cmd":"pwd"}}),
+            },
+        ];
+
+        emit_broadcasts(&caller, "general", "bot-1", &blocks).await;
+
+        let thought = recv_frame(&mut rx_end).await;
+        assert_eq!(thought.call, "door:thought");
+        assert_eq!(thought.from.as_deref(), Some("bot-1"));
+        assert_eq!(thought.data.get("room").and_then(|v| v.as_str()), Some("general"));
+        assert_eq!(thought.data.get("content").and_then(|v| v.as_str()), Some("Need a tool"));
+
+        let tool = recv_frame(&mut rx_end).await;
+        assert_eq!(tool.call, "door:tool");
+        assert_eq!(tool.from.as_deref(), Some("bot-1"));
+        assert_eq!(tool.data.get("room").and_then(|v| v.as_str()), Some("general"));
+        assert_eq!(tool.data.get("syscall").and_then(|v| v.as_str()), Some("exec:run"));
+        assert_eq!(tool.data.get("args").and_then(|v| v.get("cmd")).and_then(|v| v.as_str()), Some("pwd"));
+    }
+
+    #[tokio::test]
+    async fn emit_chat_sends_chat_frame() {
+        let (mut tx_end, mut rx_end) = pipe(8);
+        let caller = tx_end.caller();
+
+        emit_chat(&caller, "general", "bot-1", "done").await;
+
+        let chat = recv_frame(&mut rx_end).await;
+        assert_eq!(chat.call, "door:chat");
+        assert_eq!(chat.from.as_deref(), Some("bot-1"));
+        assert_eq!(chat.data.get("room").and_then(|v| v.as_str()), Some("general"));
+        assert_eq!(chat.data.get("content").and_then(|v| v.as_str()), Some("done"));
+    }
 }
