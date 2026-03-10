@@ -226,7 +226,10 @@ async fn handle_message(
             Ok((actor_name, reply)) => {
                 let mut rooms = lock_rooms(&rooms);
                 if let Some(room) = rooms.get_mut(&room_name) {
-                    let _ = room.add_message(&actor_name, &reply, HistoryKind::Assistant);
+                    if let Err(err) = room.add_message(&actor_name, &reply, HistoryKind::Assistant)
+                    {
+                        warn!(error = %err, actor = %actor_name, room = %room_name, "room: failed to persist assistant reply");
+                    }
                 }
             }
             Err(e) => {

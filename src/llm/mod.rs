@@ -89,9 +89,12 @@ impl Syscall for LlmSyscall {
                 tokio::spawn(async move {
                     tokio::select! {
                         () = cancel.cancelled() => {
-                            let _ = tx_clone
+                            if let Err(err) = tx_clone
                                 .send_error(&cancel_frame, "llm:chat cancelled")
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(error = %err, "llm: failed to send cancellation error");
+                            }
                         }
                         () = handle_chat(frame, config, clients, &tx_clone) => {}
                     }
