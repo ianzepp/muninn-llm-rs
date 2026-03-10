@@ -329,10 +329,11 @@ Do not add yet:
 
 Current state:
 
-- workable prototype with correctness hardening
-- direct async dispatch
-- global room map behind mutex
-- temporary same-room in-flight guard to prevent overlap races
+- per-room worker architecture is now in place
+- direct top-level routing to room worker mailboxes
+- same-room mutation is serialized by the worker
+- cancellation is threaded into in-flight `room:message` actor work
+- room state remains in-memory only
 
 Target state:
 
@@ -341,6 +342,43 @@ Target state:
 - serialized same-room mutation
 - cancellation-aware actor task management
 - explicit in-flight message policy for same room
+
+### Cross-turn tool outcomes
+
+Current state:
+
+- tool calls and raw tool results are private to an actor's current turn
+- only the final assistant reply is persisted into shared room history
+- later turns can see the reply text, but not the structured tool provenance
+
+Observed limitation:
+
+- later turns do not know which tools were attempted
+- later turns do not know whether a prior tool failed or succeeded
+- the model can repeat failed tool attempts because prior failure context is
+  dropped at turn boundaries
+
+Recommended direction:
+
+- do not persist full raw tool transcripts in normal room history
+- add a separate persisted room evidence/outcome lane for compact tool results
+- preserve at least:
+  - actor
+  - syscall/tool name
+  - success/failure
+  - short summary
+  - error code/class when available
+  - timestamp and turn association
+
+Intended use:
+
+- inject selected recent tool outcomes into later turns when relevant
+- give the model failure/success provenance without replaying large payloads
+- reduce pointless retried failing tool calls across turns
+
+Non-goal for this feature:
+
+- storing every raw tool payload forever as conversational history
 
 ### Door/event layer
 
