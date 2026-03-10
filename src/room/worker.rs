@@ -1,3 +1,25 @@
+//! Per-room worker task — serializes room state mutations and message handling.
+//!
+//! ARCHITECTURE
+//! ============
+//! Each active room has exactly one `RoomWorker` running in a spawned task.
+//! The worker owns the room's mutable [`Room`] state and processes requests
+//! from its mpsc mailbox sequentially. This eliminates the need for a mutex
+//! on room state while still allowing different rooms to progress concurrently.
+//!
+//! LIFECYCLE
+//! =========
+//! Workers are created lazily on the first `room:join` for a room name and
+//! destroyed when the last actor parts. When the last actor parts, the worker
+//! sends the room name on the `cleanup_tx` channel and returns from `run`,
+//! allowing `RoomSyscall` to remove the stale mailbox entry.
+//!
+//! CANCELLATION
+//! ============
+//! `room:message` spawns one actor task per actor in a `JoinSet`. The
+//! `CancellationToken` from the original request is forwarded to each actor
+//! task so they can be aborted cooperatively if the caller disconnects.
+
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -13,6 +35,12 @@ use crate::types::Data;
 
 use super::{parse_tools_field, str_field};
 
+/// A request dispatched from `RoomSyscall` to a room worker.
+///
+/// Contains everything the worker needs to handle the request and respond:
+/// the originating frame, a sender to emit reply frames, a caller for
+/// making downstream syscalls (e.g., `llm:chat`), and a cancellation token
+/// for cooperative abort on client disconnect.
 pub struct WorkerRequest {
     pub frame: Frame,
     pub tx: FrameSender,
@@ -20,6 +48,11 @@ pub struct WorkerRequest {
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
+/// Spawn a room worker task for `room_name` and return immediately.
+///
+/// The worker task owns the room state and processes requests sequentially
+/// from `rx`. When the last actor parts, the worker sends `room_name` on
+/// `cleanup_tx` so `RoomSyscall` can remove the stale mailbox entry.
 pub fn start_worker(
     room_name: String,
     rx: mpsc::Receiver<WorkerRequest>,
@@ -31,6 +64,7 @@ pub fn start_worker(
     });
 }
 
+/// The per-room worker: owns one [`Room`] and handles requests sequentially.
 struct RoomWorker {
     room_name: String,
     room: Room,
@@ -46,6 +80,8 @@ impl RoomWorker {
         }
     }
 
+    /// Main receive loop — processes one request at a time until the channel
+    /// closes or a `room:part` empties the room and signals exit.
     async fn run(&mut self, mut rx: mpsc::Receiver<WorkerRequest>) {
         while let Some(request) = rx.recv().await {
             let should_exit = self.handle(request).await;
@@ -55,6 +91,9 @@ impl RoomWorker {
         }
     }
 
+    /// Dispatch a single request to the appropriate verb handler.
+    ///
+    /// Returns `true` when the worker should exit (last actor parted).
     async fn handle(&mut self, request: WorkerRequest) -> bool {
         match request.frame.verb() {
             "join" => {
@@ -190,8 +229,19 @@ impl RoomWorker {
         send_done(&request.tx, frame).await;
     }
 
+    /// Handle a `room:message` request — the core turn-processing path.
+    ///
+    /// Records the user message in history, runs all room actors concurrently
+    /// via a `JoinSet`, commits their replies and tool outcomes to room state,
+    /// then sends the terminal `Done` frame. If the request is cancelled mid-flight,
+    /// all actor tasks are aborted and an `Error` frame is sent instead.
     async fn handle_message(&mut self, request: WorkerRequest) {
         let frame = &request.frame;
+
+        // PHASE 1: PARSE REQUEST FIELDS
+        // Extract required fields before touching room state. If any required
+        // field is missing we fail fast with an error frame before making
+        // any state changes that would need to be rolled back.
         let from = match str_field(&frame.data, "from") {
             Ok(value) => value,
             Err(err) => {
@@ -226,6 +276,10 @@ impl RoomWorker {
             }
         };
 
+        // PHASE 2: RECORD USER MESSAGE AND SNAPSHOT STATE
+        // Add the user's message to history before spawning actor tasks.
+        // Actors receive a snapshot of history at this point so all actors
+        // see the same context regardless of when they start their LLM calls.
         if let Err(err) = self.room.add_message(&from, &content, HistoryKind::User) {
             send_error_from(&request.tx, frame, &err).await;
             return;
@@ -234,8 +288,17 @@ impl RoomWorker {
 
         let actors = self.room.actors.clone();
         let history = self.room.history.clone();
+        // WHY render_recent_tool_outcomes: actors receive a compact summary of
+        // recent tool calls made during previous turns as their "memory" slot.
+        // This avoids inflating the full history with tool call details while
+        // still giving actors context about what has been tried recently.
         let memory = self.room.render_recent_tool_outcomes(8);
 
+        // PHASE 3: RUN ACTOR LOOPS CONCURRENTLY
+        // All actors in the room respond to the same message simultaneously.
+        // Each actor runs its full ReAct loop (potentially multiple LLM rounds)
+        // in a separate task. The JoinSet allows us to collect results as they
+        // complete rather than waiting for the slowest actor.
         let mut actor_tasks = JoinSet::new();
         for actor in &actors {
             let actor_name = actor.name.clone();
@@ -272,6 +335,12 @@ impl RoomWorker {
             });
         }
 
+        // PHASE 4: COLLECT RESULTS AND COMMIT TO STATE
+        // Gather each actor's reply and tool outcomes as tasks complete.
+        // Actor loop errors are logged but do not abort the other actors —
+        // a single actor failure should not prevent other actors from replying.
+        // Cancellation is the exception: if any actor reports cancellation, all
+        // remaining tasks are aborted and the request is terminated with an error.
         let mut cancelled = false;
         while let Some(result) = actor_tasks.join_next().await {
             match result {
@@ -317,12 +386,17 @@ impl RoomWorker {
     }
 }
 
+/// Send a terminal `Done` frame, logging if the channel is closed.
+///
+/// WHY log-not-panic: the caller may have already disconnected by the time
+/// the worker is ready to send done. A closed channel is expected and benign.
 async fn send_done(tx: &FrameSender, frame: &Frame) {
     if let Err(err) = tx.send_done(frame).await {
         info!(error = %err, call = %frame.call, "room: failed to send done frame");
     }
 }
 
+/// Send a plain-text error frame, logging if the channel is closed.
 async fn send_error(tx: &FrameSender, frame: &Frame, message: impl Into<String>) {
     let message = message.into();
     if let Err(err) = tx.send_error(frame, message.clone()).await {
@@ -330,6 +404,8 @@ async fn send_error(tx: &FrameSender, frame: &Frame, message: impl Into<String>)
     }
 }
 
+/// Send a structured error frame from an [`ErrorCode`] implementor, logging if
+/// the channel is closed.
 async fn send_error_from(
     tx: &FrameSender,
     frame: &Frame,

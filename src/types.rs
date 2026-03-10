@@ -100,6 +100,10 @@ pub enum Content {
 // =============================================================================
 
 /// A tool definition passed to the LLM provider API.
+///
+/// The `input_schema` is a JSON Schema object describing the tool's input.
+/// Both Anthropic (`input_schema`) and OpenAI (`parameters`) accept the same
+/// JSON Schema shape, so no conversion is needed between providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
@@ -111,7 +115,11 @@ pub struct Tool {
 // MESSAGE
 // =============================================================================
 
-/// A single message in a conversation.
+/// A single message in a conversation — role plus content.
+///
+/// `role` is one of `"user"`, `"assistant"`, or `"system"`. The `content`
+/// field is either plain text (for simple turns) or a block array (for turns
+/// containing tool calls or tool results).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
@@ -124,23 +132,39 @@ pub struct Message {
 
 /// Request payload for `llm:chat`.
 ///
-/// WHY history + context: Room sends flat history entries (the room's
-/// conversation log). The LLM subsystem converts them to provider messages.
-/// `context` carries in-progress tool loop turns (assistant responses with
-/// `tool_use` blocks and tool results) that Room accumulates between rounds.
+/// WHY history + context: `history` is the room's flat conversation log
+/// (user and assistant turns stored after each completed `room:message`).
+/// `context` carries the in-progress tool loop turns for the current round —
+/// assistant responses with `tool_use` blocks and their `tool_result` replies —
+/// which the room accumulates between ReAct iterations and has not yet committed
+/// to history. Separating the two allows the LLM to see both the stable history
+/// and the live multi-step context without conflating them.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
+    /// Profile name from `ConfigFile` selecting model, provider, and key.
     pub config: String,
+    /// Committed room history (user and assistant turns).
     pub history: Vec<HistoryEntry>,
+    /// In-progress tool loop turns for the current `room:message` request.
+    /// Empty on the first round; grows as tool calls are dispatched and
+    /// their results appended before subsequent LLM rounds.
     #[serde(default)]
     pub context: Vec<Message>,
+    /// Optional long-term memory text injected into the system prompt.
+    /// This crate never populates this; the caller (room worker) may provide it.
     #[serde(default)]
     pub memory: Option<String>,
+    /// Tool definitions made available to the LLM for this request.
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
 }
 
 /// Final assembled response from `llm:chat`.
+///
+/// This is a convenience type for callers that want a single structured
+/// result rather than consuming individual `Item` frames. The room worker
+/// does not use this type — it reads deltas directly from the frame stream
+/// to enable low-latency forwarding.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatResponse {
     pub content: Vec<ContentBlock>,
@@ -154,16 +178,37 @@ pub struct ChatResponse {
 // FRAME CONVERSION
 // =============================================================================
 
+/// The `Frame.data` map type — a flat `String → Value` map.
+///
+/// WHY `HashMap<String, Value>` rather than a typed struct: `Frame` is a
+/// kernel-level primitive shared across all syscalls. The kernel cannot know
+/// every payload shape, so it uses a generic map. Each syscall handler
+/// deserializes the relevant fields it needs using [`from_data`]/[`to_data`].
 pub type Data = HashMap<String, Value>;
 
-/// Deserialize a typed request from `Frame.data`.
+/// Deserialize a typed request from a `Frame.data` map.
+///
+/// Reconstitutes the map as a `serde_json::Value::Object` so serde's derived
+/// `Deserialize` impls can be used directly, avoiding manual field extraction.
+///
+/// # Errors
+///
+/// Returns [`LlmError::Deserialize`] if the map cannot be deserialized into `T`.
 pub fn from_data<T: serde::de::DeserializeOwned>(data: &Data) -> Result<T, LlmError> {
     let map: serde_json::Map<String, Value> =
         data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     serde_json::from_value(Value::Object(map)).map_err(|e| LlmError::Deserialize(e.to_string()))
 }
 
-/// Serialize a typed value into `Frame.data`.
+/// Serialize a typed value into a `Frame.data` map.
+///
+/// The value must serialize as a JSON object (i.e., it must be a struct or
+/// map). Primitive values and arrays are rejected with [`LlmError::Serialize`].
+///
+/// # Errors
+///
+/// Returns [`LlmError::Serialize`] if `value` cannot be serialized or does not
+/// produce a JSON object at the top level.
 pub fn to_data<T: Serialize>(value: &T) -> Result<Data, LlmError> {
     let v = serde_json::to_value(value).map_err(|e| LlmError::Serialize(e.to_string()))?;
     let Value::Object(map) = v else {

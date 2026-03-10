@@ -33,12 +33,23 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 // CLIENT
 // =============================================================================
 
+/// HTTP client for the Anthropic Messages API.
+///
+/// One instance is created per config profile at `LlmSyscall` construction time
+/// and reused across all requests for that profile. The underlying `reqwest`
+/// client maintains a connection pool, so concurrent requests share connections.
 pub struct AnthropicClient {
     http: reqwest::Client,
     api_key: String,
 }
 
 impl AnthropicClient {
+    /// Construct an `AnthropicClient` with the given API key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::HttpClientBuild`] if the `reqwest` client cannot be
+    /// constructed (e.g., invalid TLS configuration).
     pub fn new(api_key: String) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
@@ -115,6 +126,10 @@ impl AnthropicClient {
 // WIRE TYPES
 // =============================================================================
 
+/// Anthropic `/v1/messages` request body.
+///
+/// Uses borrowed data to avoid cloning message content into the request struct.
+/// `stream: true` is always set — non-streaming responses are not supported.
 #[derive(Serialize)]
 struct ApiRequest<'a> {
     model: &'a str,
@@ -126,6 +141,10 @@ struct ApiRequest<'a> {
     stream: bool,
 }
 
+/// Anthropic tool definition wire shape.
+///
+/// Mirrors [`crate::types::Tool`] but uses borrowed references to avoid
+/// cloning the potentially large `input_schema` JSON value.
 #[derive(Serialize)]
 struct AnthropicTool<'a> {
     name: &'a str,
@@ -147,15 +166,26 @@ impl<'a> AnthropicTool<'a> {
 // SSE DECODING
 // =============================================================================
 
+/// Incremental SSE parser for the Anthropic streaming response.
+///
+/// Anthropic sends Server-Sent Events delimited by double newlines (`\n\n`).
+/// Each event has `event:` and `data:` lines. The parser accumulates raw bytes
+/// in `buffer`, extracts complete events, and translates them to [`ContentDelta`]
+/// values. Token counts and model name are carried across events until the
+/// terminal `message_delta` event assembles the final [`ContentDelta::Done`].
 #[derive(Default)]
 struct AnthropicStreamParser {
     buffer: Vec<u8>,
     model: String,
     in_tokens: u64,
     out_tokens: u64,
+    /// Tracks id and name for each in-progress tool_use block by content index.
+    /// WHY keyed by index: Anthropic assigns a stable block index in
+    /// `content_block_start` that subsequent `input_json_delta` events reference.
     tool_states: std::collections::HashMap<usize, ToolCallState>,
 }
 
+/// Accumulated state for a single in-progress `tool_use` content block.
 #[derive(Default)]
 struct ToolCallState {
     id: String,
@@ -311,6 +341,11 @@ impl AnthropicStreamParser {
     }
 }
 
+/// Extract the value of a named SSE field from a complete SSE block.
+///
+/// SSE fields use `field: value` format, one per line within a double-newline
+/// delimited block. Multiple lines with the same field name are joined with `\n`
+/// (SSE spec allows this for multi-line values, though Anthropic does not use it).
 fn extract_sse_field(block: &str, field: &str) -> String {
     let prefix = format!("{field}:");
     block
@@ -325,10 +360,31 @@ fn extract_sse_field(block: &str, field: &str) -> String {
 // BLOCK RECONSTRUCTION
 // =============================================================================
 
-/// Reconstruct `ContentBlock`s from an ordered list of deltas.
+/// Reconstruct fully assembled [`ContentBlock`]s from an ordered delta list.
 ///
-/// Text and thinking deltas are concatenated. Tool use deltas assemble input
-/// JSON from fragments. Returns (blocks, stop_reason).
+/// The Anthropic (and OpenAI) streaming protocol emits content as fragments.
+/// This function reassembles those fragments into complete blocks in the order
+/// they appeared, preserving interleaving between text, thinking, and tool_use.
+///
+/// Returns `(blocks, stop_reason)`. `stop_reason` is `None` only if no
+/// `ContentDelta::Done` was present in the input — the caller should treat
+/// that as a protocol error.
+///
+/// # PHASE 1: ACCUMULATE DELTAS
+/// Iterate over every delta in order, flushing completed content of a
+/// different kind when the type changes. This preserves interleaving: if
+/// the model emits `[thinking, text, tool]`, each flush ensures the
+/// previously accumulated buffer is committed before switching types.
+///
+/// # PHASE 2: FLUSH REMAINING BUFFERS
+/// After the loop, any partially filled buffers (text, thinking, or tool
+/// blocks still open) are flushed to `blocks`. All deltas have been seen
+/// at this point, so every open buffer represents a complete block.
+///
+/// # Errors
+///
+/// Returns [`LlmError::ApiParse`] if a tool_use block's accumulated input
+/// fragment cannot be parsed as valid JSON.
 pub fn reconstruct_content_blocks(
     deltas: &[ContentDelta],
 ) -> Result<(Vec<ContentBlock>, Option<String>), LlmError> {
@@ -341,6 +397,9 @@ pub fn reconstruct_content_blocks(
     let mut tool_states: std::collections::HashMap<usize, ToolBlockState> =
         std::collections::HashMap::new();
 
+    // PHASE 1: ACCUMULATE DELTAS
+    // Flush the previous content kind whenever the type switches so blocks
+    // appear in the order they were emitted by the provider.
     for delta in deltas {
         match delta {
             ContentDelta::TextDelta(t) => {
@@ -361,6 +420,8 @@ pub fn reconstruct_content_blocks(
             } => {
                 flush_text(&mut text_buf, &mut blocks);
                 flush_thinking(&mut thinking_buf, &mut blocks);
+                // EDGE: tool_order records the first-seen order of each index
+                // so blocks are emitted in provider order, not insertion order.
                 let state = tool_states.entry(*index).or_insert_with(|| {
                     tool_order.push(*index);
                     ToolBlockState::default()
@@ -381,6 +442,9 @@ pub fn reconstruct_content_blocks(
         }
     }
 
+    // PHASE 2: FLUSH REMAINING BUFFERS
+    // Any content still in the buffers after the loop is a complete block
+    // (all deltas have been consumed). Flush in text → thinking → tools order.
     flush_text(&mut text_buf, &mut blocks);
     flush_thinking(&mut thinking_buf, &mut blocks);
     flush_tools(&mut tool_order, &mut tool_states, &mut blocks)?;
@@ -388,6 +452,9 @@ pub fn reconstruct_content_blocks(
     Ok((blocks, stop_reason))
 }
 
+/// Accumulated state for a single in-progress `tool_use` block during
+/// [`reconstruct_content_blocks`]. Input JSON arrives as partial string
+/// fragments that are concatenated in `input_buf` and parsed at flush time.
 #[derive(Default)]
 struct ToolBlockState {
     id: String,
@@ -395,6 +462,7 @@ struct ToolBlockState {
     input_buf: String,
 }
 
+/// Flush the text buffer into a `ContentBlock::Text` if non-empty.
 fn flush_text(buf: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !buf.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -403,6 +471,7 @@ fn flush_text(buf: &mut String, blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+/// Flush the thinking buffer into a `ContentBlock::Thinking` if non-empty.
 fn flush_thinking(buf: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !buf.is_empty() {
         blocks.push(ContentBlock::Thinking {
@@ -411,6 +480,14 @@ fn flush_thinking(buf: &mut String, blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+/// Flush all pending tool_use blocks in their original arrival order.
+///
+/// Tool blocks with an empty `id` are silently skipped — they represent
+/// content_block_start events for non-tool blocks that were ignored upstream.
+///
+/// # Errors
+///
+/// Returns [`LlmError::ApiParse`] if `input_buf` cannot be parsed as JSON.
 fn flush_tools(
     tool_order: &mut Vec<usize>,
     tool_states: &mut std::collections::HashMap<usize, ToolBlockState>,

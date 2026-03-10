@@ -30,6 +30,12 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 // CLIENT
 // =============================================================================
 
+/// HTTP client for the OpenAI-compatible chat completions API.
+///
+/// One instance is created per config profile at `LlmSyscall` construction time
+/// and reused across all requests for that profile. `base_url` defaults to the
+/// official OpenAI endpoint but can be overridden to point at any compatible API
+/// (e.g., Azure OpenAI, local Ollama, or other OpenAI-compatible services).
 pub struct OpenAiClient {
     http: reqwest::Client,
     api_key: String,
@@ -37,6 +43,15 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
+    /// Construct an `OpenAiClient` with the given API key and optional base URL.
+    ///
+    /// `base_url` defaults to `https://api.openai.com` when `None`. Trailing
+    /// slashes are stripped so path construction is consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::HttpClientBuild`] if the `reqwest` client cannot be
+    /// constructed.
     pub fn new(api_key: String, base_url: Option<&str>) -> Result<Self, LlmError> {
         let base_url = base_url
             .unwrap_or(DEFAULT_BASE_URL)
@@ -127,6 +142,7 @@ impl OpenAiClient {
 // WIRE TYPES
 // =============================================================================
 
+/// OpenAI `/v1/chat/completions` request body.
 #[derive(Serialize)]
 struct CcRequest<'a> {
     model: &'a str,
@@ -135,6 +151,9 @@ struct CcRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [CcToolDef<'a>]>,
     stream: bool,
+    /// WHY include_usage: OpenAI only emits token counts in a trailing
+    /// chunk when this option is set. Without it we cannot populate
+    /// `ContentDelta::Done.input_tokens` / `output_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<CcStreamOptions>,
 }
@@ -144,6 +163,12 @@ struct CcStreamOptions {
     include_usage: bool,
 }
 
+/// A single message in the OpenAI chat completions wire format.
+///
+/// All fields are optional at the struct level because different message
+/// kinds populate different subsets: text messages set `content`, assistant
+/// messages with tool calls set `tool_calls`, and tool result messages set
+/// both `content` and `tool_call_id`.
 #[derive(Serialize)]
 struct CcMessage {
     role: String,
@@ -155,6 +180,7 @@ struct CcMessage {
     tool_call_id: Option<String>,
 }
 
+/// A single tool call reference in an assistant message.
 #[derive(Serialize)]
 struct CcToolCall {
     id: String,
@@ -163,12 +189,16 @@ struct CcToolCall {
     function: CcFunction,
 }
 
+/// The function name and JSON-serialized arguments for a tool call.
 #[derive(Serialize)]
 struct CcFunction {
     name: String,
+    /// WHY String not Value: OpenAI requires arguments as a JSON *string*,
+    /// not an inline object. We serialize the input Value to a string here.
     arguments: String,
 }
 
+/// OpenAI tool definition wire shape (wraps a function definition).
 #[derive(Serialize)]
 struct CcToolDef<'a> {
     #[serde(rename = "type")]
@@ -176,6 +206,9 @@ struct CcToolDef<'a> {
     function: CcFunctionDef<'a>,
 }
 
+/// OpenAI function definition — name, description, and JSON Schema parameters.
+///
+/// Uses borrowed references to avoid cloning the `input_schema` JSON value.
 #[derive(Serialize)]
 struct CcFunctionDef<'a> {
     name: &'a str,
@@ -200,6 +233,13 @@ impl<'a> CcToolDef<'a> {
 // MESSAGE BUILDING
 // =============================================================================
 
+/// Convert a system prompt and provider-neutral messages into the OpenAI wire format.
+///
+/// WHY system-as-message: Unlike Anthropic (which has a top-level `system` field),
+/// OpenAI embeds the system prompt as the first message with `role: "system"`.
+/// This function handles that injection and also translates `Content::Blocks`
+/// (which may contain tool calls and tool results) into the OpenAI multi-message
+/// format where each tool result is a separate message with `role: "tool"`.
 fn build_cc_messages(system: &str, messages: &[Message]) -> Vec<CcMessage> {
     let mut out = Vec::new();
     if !system.trim().is_empty() {
@@ -280,16 +320,30 @@ fn build_cc_messages(system: &str, messages: &[Message]) -> Vec<CcMessage> {
 // NDJSON DECODING
 // =============================================================================
 
+/// Incremental NDJSON/SSE parser for the OpenAI streaming response.
+///
+/// OpenAI sends `data: <json>\n` lines. The parser accumulates raw bytes in
+/// `buffer`, extracts complete lines, and translates each JSON object to zero
+/// or more [`ContentDelta`] values.
+///
+/// Token counts are emitted in a trailing chunk (when `stream_options.include_usage`
+/// is set) and stored until `take_done` assembles the final `ContentDelta::Done`.
+/// The stop reason arrives in the `finish_reason` field of the choices array and
+/// is stored as `pending_stop_reason` until the usage chunk confirms the stream end.
 #[derive(Default)]
 struct OpenAiStreamParser {
     buffer: Vec<u8>,
     model: String,
     in_tokens: u64,
     out_tokens: u64,
+    /// Tracks id and name for each in-progress tool call by array index.
     tool_states: std::collections::HashMap<usize, ToolCallState>,
+    /// Stop reason received from a choice's `finish_reason` field, held until
+    /// the usage chunk arrives so both can be combined into a single `Done` delta.
     pending_stop_reason: Option<String>,
 }
 
+/// Accumulated state for a single in-progress tool call delta.
 #[derive(Default)]
 struct ToolCallState {
     id: String,

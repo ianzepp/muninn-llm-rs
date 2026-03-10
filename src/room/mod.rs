@@ -45,13 +45,26 @@ type WorkerMap = HashMap<String, mpsc::Sender<WorkerRequest>>;
 ///
 /// Top-level state tracks room worker mailboxes only. Each worker owns the
 /// mutable state for a single room.
+///
+/// WHY `Arc<Mutex<WorkerMap>>`: `Syscall::dispatch` takes `&self` so all
+/// routing state must be interior-mutable. The lock is held only briefly
+/// (map lookup or insert), never across await points.
+///
+/// WHY `Arc<Mutex<UnboundedReceiver>>`: the `Syscall` trait requires `Sync`.
+/// `UnboundedReceiver` is `!Sync`, so it must be wrapped in a `Mutex`.
+/// Only one thread calls `dispatch` at a time in practice (the kernel
+/// dispatch loop), so the mutex is uncontended.
 pub struct RoomSyscall {
     workers: Arc<Mutex<WorkerMap>>,
+    /// Sender given to each worker so it can signal when its room is empty.
     cleanup_tx: mpsc::UnboundedSender<String>,
+    /// Receiver drained at the start of each dispatch call to remove stale entries.
     cleanup_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
 }
 
 impl RoomSyscall {
+    /// Create a new `RoomSyscall`. The config is accepted for API consistency
+    /// but is not currently used — room state is ephemeral and in-memory only.
     #[must_use]
     pub fn new(_config: ConfigFile) -> Self {
         let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
@@ -62,6 +75,14 @@ impl RoomSyscall {
         }
     }
 
+    /// Remove stale worker mailbox entries for rooms that have shut down.
+    ///
+    /// WHY unbounded channel + drain-on-dispatch: workers signal cleanup by
+    /// sending their room name on `cleanup_tx` when the last actor parts.
+    /// Rather than acquiring the workers lock from the worker task (which
+    /// would create a potential deadlock), the cleanup messages are drained
+    /// here, at the start of each `dispatch` call, under a short-lived lock.
+    /// This amortizes cleanup across requests without background tasks.
     fn drain_cleanup(&self) {
         let mut cleanup = self
             .cleanup_rx
@@ -77,6 +98,7 @@ impl RoomSyscall {
         }
     }
 
+    /// Extract the required `"room"` field from frame data.
     fn room_from_frame(frame: &Frame) -> Result<String, RoomError> {
         frame
             .data
@@ -86,6 +108,13 @@ impl RoomSyscall {
             .ok_or_else(|| RoomError::Deserialize("missing 'room' field".into()))
     }
 
+    /// Return the sender for an existing room worker, or create a new one.
+    ///
+    /// When `create` is `false` and no worker exists, returns
+    /// [`RoomError::RoomNotFound`] instead of spawning a new worker. This
+    /// distinguishes operations that must target an existing room (`room:part`,
+    /// `room:history`) from those that create rooms implicitly (`room:join`,
+    /// `room:message`).
     fn worker_sender(
         &self,
         room: &str,
@@ -112,6 +141,13 @@ impl RoomSyscall {
         Ok(tx)
     }
 
+    /// Send a request to the named room's worker, with one automatic retry on failure.
+    ///
+    /// WHY retry on send failure: the channel send can fail if the worker task
+    /// exited between `worker_sender` returning and the `send` completing. This
+    /// is a race condition between the cleanup drain and a concurrent request.
+    /// On failure we remove the stale entry and, if `create` is set, spawn a
+    /// fresh worker and retry once. A second failure is treated as terminal.
     async fn dispatch_to_worker(
         &self,
         room: &str,
@@ -130,6 +166,8 @@ impl RoomSyscall {
         };
 
         if sender.send(request).await.is_err() {
+            // WHY remove before re-acquiring sender: we cannot call worker_sender
+            // while holding the stale sender, since worker_sender also locks workers.
             {
                 let mut workers = self
                     .workers
@@ -212,7 +250,12 @@ impl Syscall for RoomSyscall {
     }
 }
 
-fn parse_tools_field(data: &Data) -> Result<Vec<Tool>, RoomError> {
+/// Deserialize the optional `"tools"` field from a `Data` map.
+///
+/// Returns an empty `Vec` if the field is absent — tools are optional for
+/// all `room:*` verbs. Returns a deserialization error only if the field is
+/// present but malformed.
+pub(crate) fn parse_tools_field(data: &Data) -> Result<Vec<Tool>, RoomError> {
     let Some(value) = data.get("tools") else {
         return Ok(Vec::new());
     };
@@ -221,17 +264,20 @@ fn parse_tools_field(data: &Data) -> Result<Vec<Tool>, RoomError> {
         .map_err(|e| RoomError::Deserialize(format!("invalid 'tools' field: {e}")))
 }
 
-fn str_field(data: &Data, key: &str) -> Result<String, RoomError> {
+/// Extract a required string field from a `Data` map.
+pub(crate) fn str_field(data: &Data, key: &str) -> Result<String, RoomError> {
     data.get(key)
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .ok_or_else(|| RoomError::Deserialize(format!("missing '{key}' field")))
 }
 
+/// Box an [`ErrorCode`] implementor for return from `Syscall::dispatch`.
 fn box_err(e: impl ErrorCode + Send + 'static) -> Box<dyn ErrorCode + Send> {
     Box::new(e)
 }
 
+/// Construct a boxed [`LlmError::InternalCall`] from a plain message string.
 fn box_msg(msg: String) -> Box<dyn ErrorCode + Send> {
     Box::new(crate::error::LlmError::InternalCall(msg))
 }

@@ -56,7 +56,7 @@ pub struct LlmProfile {
     /// OpenAI API mode. Only "chat_completions" is currently supported.
     #[serde(default)]
     pub openai_api: Option<String>,
-    /// OpenAI-compatible base URL (default: https://api.openai.com).
+    /// OpenAI-compatible base URL (default: <https://api.openai.com>).
     #[serde(default)]
     pub openai_base_url: Option<String>,
     /// System prompt slot 0: persistent identity.

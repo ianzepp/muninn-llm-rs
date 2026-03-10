@@ -34,12 +34,27 @@ use crate::types::{ChatRequest, Content, ContentDelta, Data, Message, from_data}
 // PROVIDER CLIENT ENUM
 // =============================================================================
 
+/// A provider-specific HTTP client, unified behind a single streaming interface.
+///
+/// WHY an enum rather than a trait object: `stream_chat` takes a generic
+/// `FnMut` callback with an associated `Future`, which cannot be expressed as
+/// a `dyn Trait` without boxing every future. The enum avoids that overhead
+/// while still keeping provider dispatch in one place.
 pub(crate) enum ProviderClient {
     Anthropic(AnthropicClient),
     OpenAi(OpenAiClient),
 }
 
 impl ProviderClient {
+    /// Construct a `ProviderClient` from a config profile.
+    ///
+    /// Resolves the API key and validates `openai_api` mode eagerly so that
+    /// misconfiguration fails at startup rather than on the first request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError`] if the API key is missing, the provider name is
+    /// unknown, or the OpenAI API mode is unsupported.
     pub(crate) fn build(profile: &LlmProfile) -> Result<Self, LlmError> {
         let api_key = resolve_api_key(profile)?;
         match profile.provider.as_str() {
@@ -62,6 +77,11 @@ impl ProviderClient {
         }
     }
 
+    /// Stream a chat completion, invoking `on_delta` for each decoded delta.
+    ///
+    /// Delegates to the concrete provider client. The `on_delta` callback
+    /// receives each [`ContentDelta`] as it arrives from the provider stream,
+    /// allowing the caller to forward fragments upstream without buffering.
     pub(crate) async fn stream_chat<F, Fut>(
         &self,
         model: &str,
@@ -90,6 +110,10 @@ impl ProviderClient {
     }
 }
 
+/// Build one `ProviderClient` per named config profile, returning them as a map.
+///
+/// Called once at `LlmSyscall` construction time. Building all clients eagerly
+/// means API key errors are surfaced before the first request, not mid-flight.
 pub(crate) fn build_clients(
     config: &ConfigFile,
 ) -> Result<HashMap<String, ProviderClient>, LlmError> {
@@ -104,12 +128,30 @@ pub(crate) fn build_clients(
 // HANDLE CHAT
 // =============================================================================
 
+/// Serve a single `llm:chat` request, emitting provider deltas as `Item` frames.
+///
+/// This function runs inside a spawned task (see `LlmSyscall::dispatch`) and
+/// owns the full lifecycle of the provider stream for one request. It sends
+/// the terminal `Done` or `Error` frame before returning.
+///
+/// # Frame Stream Emitted
+///
+/// ```text
+/// Item { type: "text_delta",     text }           — one per text fragment
+/// Item { type: "thinking_delta", thinking }       — one per thinking fragment
+/// Item { type: "tool_use_delta", id, name, input } — one per tool call fragment
+/// Item { type: "done", stop_reason, model, ... }  — once at stream end
+/// Done                                             — terminal frame
+/// ```
 pub(crate) async fn handle_chat(
     frame: Frame,
     config: Arc<ConfigFile>,
     clients: Arc<HashMap<String, ProviderClient>>,
     tx: &FrameSender,
 ) {
+    // PHASE 1: DESERIALIZE AND RESOLVE CONFIG
+    // Parse the request payload and look up the named profile and its client.
+    // Both lookups must succeed before any network activity begins.
     let req: ChatRequest = match from_data(&frame.data) {
         Ok(r) => r,
         Err(e) => {
@@ -132,6 +174,11 @@ pub(crate) async fn handle_chat(
         return;
     };
 
+    // PHASE 2: BUILD SYSTEM PROMPT AND MESSAGE LIST
+    // Assemble the cacheable system prompt from the profile and call context,
+    // then flatten history entries and in-progress context into a message list.
+    // The room name is read from the frame trace rather than the data payload
+    // so it is available even when the caller does not include it in data.
     let room = frame
         .trace
         .as_ref()
@@ -150,6 +197,9 @@ pub(crate) async fn handle_chat(
         traits: &config.traits,
     });
 
+    // WHY extend with context after history: context holds the in-progress
+    // tool loop turns for the current request. They must appear after the
+    // committed history so the model sees them as the most recent turns.
     let mut messages = history_to_messages(&req.history);
     messages.extend(req.context);
 
@@ -159,6 +209,9 @@ pub(crate) async fn handle_chat(
 
     info!(config = %req.config, room = %room, history = req.history.len(), "llm: chat start");
 
+    // PHASE 3: STREAM PROVIDER RESPONSE
+    // Each delta is forwarded upstream as an Item frame immediately so the
+    // caller can display text as it arrives without waiting for the full turn.
     let stream_result = client
         .stream_chat(
             &model,
@@ -194,6 +247,10 @@ pub(crate) async fn handle_chat(
 // DELTA → FRAME DATA
 // =============================================================================
 
+/// Convert a [`ContentDelta`] into the flat `Data` map emitted as an `Item` frame.
+///
+/// The `type` key discriminates the delta kind for downstream consumers, matching
+/// the frame stream contract documented on [`handle_chat`].
 fn delta_to_data(delta: &ContentDelta) -> Data {
     let mut d = Data::new();
     match delta {
@@ -237,7 +294,13 @@ fn delta_to_data(delta: &ContentDelta) -> Data {
 // HISTORY → MESSAGES
 // =============================================================================
 
-/// Convert room history entries to provider-neutral messages.
+/// Convert room history entries into provider-neutral [`Message`] values.
+///
+/// WHY filter to User/Assistant only: `HistoryKind` may be extended with
+/// system-level or metadata entries in the future. Only `User` and `Assistant`
+/// map to valid LLM message roles; other kinds carry no information the model
+/// should see and are silently dropped here rather than causing downstream
+/// serialization failures.
 pub fn history_to_messages(history: &[crate::room::state::HistoryEntry]) -> Vec<Message> {
     use crate::room::state::HistoryKind;
 

@@ -33,6 +33,11 @@ pub struct Actor {
 // =============================================================================
 
 /// The role of a history entry — maps to LLM message roles.
+///
+/// WHY only User/Assistant: the room persists only user input and actor replies.
+/// System-level or tool-call turns are transient — they exist in the in-progress
+/// `context` during a `room:message` turn but are never committed to `history`.
+/// This keeps the stored history clean and directly usable as LLM messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HistoryKind {
     User,
@@ -40,6 +45,7 @@ pub enum HistoryKind {
 }
 
 impl HistoryKind {
+    /// Return the LLM message role string for this kind.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -61,15 +67,23 @@ pub struct HistoryEntry {
 }
 
 /// A compact persisted summary of a tool outcome from a completed turn.
+///
+/// Unlike the full `ToolResult` content passed back to the LLM, this record
+/// is stored permanently in the room and injected as memory context in future
+/// turns. It is intentionally compact — the `summary` field is truncated to
+/// 160 characters — to avoid inflating the system prompt with tool details.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutcomeRecord {
     pub actor: String,
     pub syscall: String,
     pub ok: bool,
+    /// Truncated tool result content (max 160 chars).
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// Unix seconds of the history entry this outcome belongs to.
     pub ts: i64,
+    /// History entry id of the user message that triggered this tool call.
     pub turn_id: u64,
 }
 
@@ -78,10 +92,16 @@ pub struct ToolOutcomeRecord {
 // =============================================================================
 
 /// In-memory state for a single room.
+///
+/// Owned exclusively by the room's worker task (see `room::worker`).
+/// All mutations go through the worker's sequential receive loop, so no
+/// synchronization is required on these fields.
 pub struct Room {
     pub actors: Vec<Actor>,
     pub history: Vec<HistoryEntry>,
+    /// Compact log of tool calls from completed turns, used for memory injection.
     pub tool_outcomes: Vec<ToolOutcomeRecord>,
+    /// Monotonic counter for assigning stable `HistoryEntry.id` values.
     next_id: u64,
 }
 
@@ -128,10 +148,17 @@ impl Room {
         }
     }
 
+    /// Append a tool outcome record to the room's tool log.
     pub fn add_tool_outcome(&mut self, outcome: ToolOutcomeRecord) {
         self.tool_outcomes.push(outcome);
     }
 
+    /// Render the `limit` most recent tool outcomes as a markdown bullet list.
+    ///
+    /// Returns an empty string if `limit` is zero or no outcomes exist, so
+    /// callers can pass this directly to the memory slot without checking.
+    /// The list is chronological (oldest first within the window) so the
+    /// model reads tool history in the order events occurred.
     #[must_use]
     pub fn render_recent_tool_outcomes(&self, limit: usize) -> String {
         if limit == 0 || self.tool_outcomes.is_empty() {
