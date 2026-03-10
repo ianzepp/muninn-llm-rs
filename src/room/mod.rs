@@ -19,7 +19,7 @@ mod handlers;
 mod message;
 pub mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -47,6 +47,7 @@ use crate::types::{Data, Tool};
 /// updates; the async LLM loop runs outside the lock.
 pub struct RoomSyscall {
     rooms: Arc<Mutex<HashMap<String, Room>>>,
+    in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RoomSyscall {
@@ -54,6 +55,7 @@ impl RoomSyscall {
     pub fn new(_config: ConfigFile) -> Self {
         Self {
             rooms: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -148,6 +150,8 @@ async fn handle_message(
     let room_name = str_field(&frame.data, "room").map_err(box_err)?;
     let from = str_field(&frame.data, "from").map_err(box_err)?;
     let content = str_field(&frame.data, "content").map_err(box_err)?;
+    let _guard =
+        RoomMessageGuard::acquire(Arc::clone(&syscall.in_flight), &room_name).map_err(box_err)?;
 
     let allowed_prefixes: Vec<String> = frame
         .data
@@ -160,11 +164,7 @@ async fn handle_message(
         })
         .unwrap_or_default();
 
-    let tools: Vec<Tool> = frame
-        .data
-        .get("tools")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let tools = parse_tools_field(&frame.data).map_err(box_err)?;
 
     // Snapshot state needed for the loop — hold lock briefly.
     let (actors, history) = {
@@ -261,6 +261,48 @@ fn str_field(data: &Data, key: &str) -> Result<String, RoomError> {
         .ok_or_else(|| RoomError::Deserialize(format!("missing '{key}' field")))
 }
 
+fn parse_tools_field(data: &Data) -> Result<Vec<Tool>, RoomError> {
+    let Some(value) = data.get("tools") else {
+        return Ok(Vec::new());
+    };
+
+    serde_json::from_value(value.clone())
+        .map_err(|e| RoomError::Deserialize(format!("invalid 'tools' field: {e}")))
+}
+
+struct RoomMessageGuard {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    room: String,
+}
+
+impl RoomMessageGuard {
+    fn acquire(in_flight: Arc<Mutex<HashSet<String>>>, room: &str) -> Result<Self, RoomError> {
+        let room = room.to_string();
+        let inserted = {
+            let mut guard = in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.insert(room.clone())
+        };
+
+        if !inserted {
+            return Err(RoomError::RoomBusy { room });
+        }
+
+        Ok(Self { in_flight, room })
+    }
+}
+
+impl Drop for RoomMessageGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&self.room);
+    }
+}
+
 fn box_err(e: impl ErrorCode + Send + 'static) -> Box<dyn ErrorCode + Send> {
     Box::new(e)
 }
@@ -268,3 +310,7 @@ fn box_err(e: impl ErrorCode + Send + 'static) -> Box<dyn ErrorCode + Send> {
 fn box_msg(msg: String) -> Box<dyn ErrorCode + Send> {
     Box::new(crate::error::LlmError::InternalCall(msg))
 }
+
+#[cfg(test)]
+#[path = "mod_test.rs"]
+mod tests;

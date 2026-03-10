@@ -79,6 +79,7 @@ impl Syscall for LlmSyscall {
         match frame.verb() {
             "chat" => {
                 let frame = frame.clone();
+                let cancel_frame = frame.clone();
                 let config = Arc::clone(&self.config);
                 let clients = Arc::clone(&self.clients);
                 let tx_clone = tx.clone();
@@ -87,7 +88,11 @@ impl Syscall for LlmSyscall {
                 // the provider stream and stops further frame emission.
                 tokio::spawn(async move {
                     tokio::select! {
-                        () = cancel.cancelled() => {}
+                        () = cancel.cancelled() => {
+                            let _ = tx_clone
+                                .send_error(&cancel_frame, "llm:chat cancelled")
+                                .await;
+                        }
                         () = handle_chat(frame, config, clients, &tx_clone) => {}
                     }
                 });

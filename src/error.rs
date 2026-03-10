@@ -80,6 +80,9 @@ pub enum RoomError {
     #[error("room not found: {room}")]
     RoomNotFound { room: String },
 
+    #[error("room busy: {room}")]
+    RoomBusy { room: String },
+
     #[error("actor not found: {name} in room {room}")]
     ActorNotFound { room: String, name: String },
 
@@ -100,6 +103,7 @@ impl ErrorCode for RoomError {
     fn error_code(&self) -> &'static str {
         match self {
             Self::RoomNotFound { .. } => "E_ROOM_NOT_FOUND",
+            Self::RoomBusy { .. } => "E_ROOM_BUSY",
             Self::ActorNotFound { .. } => "E_ACTOR_NOT_FOUND",
             Self::ActorAlreadyJoined { .. } => "E_ACTOR_ALREADY_JOINED",
             Self::Deserialize(_) => "E_DESERIALIZE",

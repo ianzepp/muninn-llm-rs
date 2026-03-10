@@ -20,7 +20,7 @@ fn parser_keeps_tool_fragments_separate_by_index() {
     );
 
     let deltas = parser.push_chunk(chunk.as_bytes()).unwrap();
-    let (blocks, _) = reconstruct_content_blocks(&deltas);
+    let (blocks, _) = reconstruct_content_blocks(&deltas).unwrap();
     assert!(matches!(&blocks[0], ContentBlock::ToolUse { id, .. } if id == "tool_1"));
     assert!(matches!(&blocks[1], ContentBlock::ToolUse { id, .. } if id == "tool_2"));
 }
@@ -54,8 +54,21 @@ fn reconstruct_content_blocks_handles_multiple_tool_indices() {
         },
     ];
 
-    let (blocks, _) = reconstruct_content_blocks(&deltas);
+    let (blocks, _) = reconstruct_content_blocks(&deltas).unwrap();
     assert_eq!(blocks.len(), 2);
     assert!(matches!(&blocks[0], ContentBlock::ToolUse { id, .. } if id == "tool_1"));
     assert!(matches!(&blocks[1], ContentBlock::ToolUse { id, .. } if id == "tool_2"));
+}
+
+#[test]
+fn reconstruct_content_blocks_rejects_invalid_tool_json() {
+    let deltas = vec![ContentDelta::ToolUseDelta {
+        index: 0,
+        id: "tool_1".to_string(),
+        name: "lookup".to_string(),
+        input_fragment: "{\"a\":".to_string(),
+    }];
+
+    let err = reconstruct_content_blocks(&deltas).unwrap_err();
+    assert!(matches!(err, crate::error::LlmError::ApiParse(_)));
 }

@@ -1,8 +1,10 @@
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use muninn_kernel::pipe::pipe;
+use muninn_kernel::sender::FrameSender;
 
 use super::*;
 
@@ -80,4 +82,28 @@ async fn emit_chat_sends_chat_frame() {
         chat.data.get("content").and_then(|v| v.as_str()),
         Some("done")
     );
+}
+
+#[tokio::test]
+async fn collect_chat_deltas_requires_terminal_frame() {
+    let (mut caller_end, responder_end) = pipe(8);
+    let caller = caller_end.caller();
+    let req = Frame::request("llm:chat");
+    let mut stream = caller.call(req.clone()).await.unwrap();
+    let sender = responder_end.sender();
+    let mut data = Data::new();
+    data.insert("type".into(), "text_delta".into());
+    data.insert("text".into(), "partial".into());
+    let item = req.item(data);
+
+    sender.send(item).await.unwrap();
+    drop(sender);
+
+    let (tx, _rx) = mpsc::channel(4);
+    let upstream = FrameSender::new(tx);
+    let err = collect_chat_deltas(&mut stream, &upstream, &req, "general", "bot-1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LlmError::InternalCall(_)));
+    assert!(err.to_string().contains("terminal frame"));
 }

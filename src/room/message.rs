@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use muninn_kernel::frame::{Frame, Status};
+use muninn_kernel::pipe::CallStream;
 use muninn_kernel::pipe::Caller;
 use muninn_kernel::sender::FrameSender;
 
@@ -63,65 +64,15 @@ pub async fn run_actor_loop(
             .call(chat_frame)
             .await
             .map_err(|e| LlmError::InternalCall(e.to_string()))?;
+        let deltas =
+            collect_chat_deltas(&mut stream, upstream, req_frame, room, actor_name).await?;
 
-        let mut deltas: Vec<ContentDelta> = Vec::new();
-
-        // Stream items from llm:chat, forwarding text deltas upstream.
-        loop {
-            let Some(frame) = stream.recv().await else {
-                break;
-            };
-            if frame.status == Status::Error {
-                let msg = frame
-                    .data
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("llm:chat error");
-                return Err(LlmError::InternalCall(msg.to_string()));
-            }
-            if frame.status == Status::Done {
-                break;
-            }
-            if frame.status != Status::Item {
-                continue;
-            }
-
-            let delta_type = frame
-                .data
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            // Forward text deltas upstream immediately for streaming display.
-            if delta_type == "text_delta" {
-                let text = frame
-                    .data
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !text.is_empty() {
-                    let mut d = Data::new();
-                    d.insert("type".into(), "text_delta".into());
-                    d.insert("actor".into(), actor_name.into());
-                    d.insert("room".into(), room.into());
-                    d.insert("text".into(), text.clone().into());
-                    let _ = upstream.send(req_frame.item(d)).await;
-
-                    deltas.push(ContentDelta::TextDelta(text));
-                    continue;
-                }
-            }
-
-            // Reconstruct other delta types for block assembly.
-            let delta = frame_to_delta(&frame.data);
-            if let Some(d) = delta {
-                deltas.push(d);
-            }
-        }
-
-        let (blocks, stop_reason_opt) = reconstruct_content_blocks(&deltas);
-        let stop_reason = stop_reason_opt.as_deref().unwrap_or("end_turn");
+        let (blocks, stop_reason_opt) = reconstruct_content_blocks(&deltas)?;
+        let Some(stop_reason) = stop_reason_opt.as_deref() else {
+            return Err(LlmError::InternalCall(
+                "llm:chat stream ended without a done delta".to_string(),
+            ));
+        };
 
         info!(config = %config, round = round + 1, stop_reason = %stop_reason, blocks = blocks.len(), "room: llm round result");
         emit_broadcasts(caller, room, actor_name, &blocks).await;
@@ -521,6 +472,77 @@ fn build_chat_frame(
     frame.data = data;
     frame.trace = Some(serde_json::json!({ "room": room }));
     Ok(frame)
+}
+
+async fn collect_chat_deltas(
+    stream: &mut CallStream,
+    upstream: &FrameSender,
+    req_frame: &Frame,
+    room: &str,
+    actor_name: &str,
+) -> Result<Vec<ContentDelta>, LlmError> {
+    let mut deltas: Vec<ContentDelta> = Vec::new();
+    let mut saw_terminal = false;
+
+    loop {
+        let Some(frame) = stream.recv().await else {
+            break;
+        };
+        match frame.status {
+            Status::Error => {
+                let msg = frame
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("llm:chat error");
+                return Err(LlmError::InternalCall(msg.to_string()));
+            }
+            Status::Done => {
+                saw_terminal = true;
+                break;
+            }
+            Status::Item => {
+                let delta_type = frame
+                    .data
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if delta_type == "text_delta" {
+                    let text = frame
+                        .data
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !text.is_empty() {
+                        let mut d = Data::new();
+                        d.insert("type".into(), "text_delta".into());
+                        d.insert("actor".into(), actor_name.into());
+                        d.insert("room".into(), room.into());
+                        d.insert("text".into(), text.clone().into());
+                        let _ = upstream.send(req_frame.item(d)).await;
+
+                        deltas.push(ContentDelta::TextDelta(text));
+                        continue;
+                    }
+                }
+
+                if let Some(delta) = frame_to_delta(&frame.data) {
+                    deltas.push(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_terminal {
+        return Err(LlmError::InternalCall(
+            "llm:chat stream closed before terminal frame".to_string(),
+        ));
+    }
+
+    Ok(deltas)
 }
 
 #[cfg(test)]

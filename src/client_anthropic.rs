@@ -329,7 +329,9 @@ fn extract_sse_field(block: &str, field: &str) -> String {
 ///
 /// Text and thinking deltas are concatenated. Tool use deltas assemble input
 /// JSON from fragments. Returns (blocks, stop_reason).
-pub fn reconstruct_content_blocks(deltas: &[ContentDelta]) -> (Vec<ContentBlock>, Option<String>) {
+pub fn reconstruct_content_blocks(
+    deltas: &[ContentDelta],
+) -> Result<(Vec<ContentBlock>, Option<String>), LlmError> {
     let mut blocks: Vec<ContentBlock> = Vec::new();
     let mut stop_reason: Option<String> = None;
 
@@ -343,12 +345,12 @@ pub fn reconstruct_content_blocks(deltas: &[ContentDelta]) -> (Vec<ContentBlock>
         match delta {
             ContentDelta::TextDelta(t) => {
                 flush_thinking(&mut thinking_buf, &mut blocks);
-                flush_tools(&mut tool_order, &mut tool_states, &mut blocks);
+                flush_tools(&mut tool_order, &mut tool_states, &mut blocks)?;
                 text_buf.push_str(t);
             }
             ContentDelta::ThinkingDelta(t) => {
                 flush_text(&mut text_buf, &mut blocks);
-                flush_tools(&mut tool_order, &mut tool_states, &mut blocks);
+                flush_tools(&mut tool_order, &mut tool_states, &mut blocks)?;
                 thinking_buf.push_str(t);
             }
             ContentDelta::ToolUseDelta {
@@ -381,9 +383,9 @@ pub fn reconstruct_content_blocks(deltas: &[ContentDelta]) -> (Vec<ContentBlock>
 
     flush_text(&mut text_buf, &mut blocks);
     flush_thinking(&mut thinking_buf, &mut blocks);
-    flush_tools(&mut tool_order, &mut tool_states, &mut blocks);
+    flush_tools(&mut tool_order, &mut tool_states, &mut blocks)?;
 
-    (blocks, stop_reason)
+    Ok((blocks, stop_reason))
 }
 
 #[derive(Default)]
@@ -413,7 +415,7 @@ fn flush_tools(
     tool_order: &mut Vec<usize>,
     tool_states: &mut std::collections::HashMap<usize, ToolBlockState>,
     blocks: &mut Vec<ContentBlock>,
-) {
+) -> Result<(), LlmError> {
     for index in std::mem::take(tool_order) {
         let Some(state) = tool_states.remove(&index) else {
             continue;
@@ -421,14 +423,20 @@ fn flush_tools(
         if state.id.is_empty() {
             continue;
         }
-        let input = serde_json::from_str::<Value>(&state.input_buf)
-            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+        let input = serde_json::from_str::<Value>(&state.input_buf).map_err(|e| {
+            LlmError::ApiParse(format!(
+                "invalid Anthropic tool JSON for block {index} ({}/{}): {e}",
+                state.name, state.id
+            ))
+        })?;
         blocks.push(ContentBlock::ToolUse {
             id: state.id,
             name: state.name,
             input,
         });
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
