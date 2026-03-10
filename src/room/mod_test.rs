@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use serde_json::json;
+use tokio::sync::mpsc;
 
 use super::*;
 
@@ -16,33 +16,36 @@ fn parse_tools_field_rejects_invalid_schema() {
 }
 
 #[test]
-fn room_message_guard_rejects_same_room_overlap() {
-    let in_flight = Arc::new(Mutex::new(HashSet::new()));
-    let guard = RoomMessageGuard::acquire(Arc::clone(&in_flight), "general").unwrap();
-
-    let Err(err) = RoomMessageGuard::acquire(Arc::clone(&in_flight), "general") else {
-        panic!("second guard acquisition should fail");
-    };
-    assert!(matches!(
-        err,
-        RoomError::RoomBusy { room } if room == "general"
-    ));
-
-    drop(guard);
-
-    let guard = RoomMessageGuard::acquire(Arc::clone(&in_flight), "general").unwrap();
-    drop(guard);
-    assert!(
-        in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
-}
-
-#[test]
 fn parse_tools_field_accepts_missing_tools() {
     let data = HashMap::new();
     let tools = parse_tools_field(&data).unwrap();
     assert!(tools.is_empty());
+}
+
+#[test]
+fn drain_cleanup_removes_closed_worker_from_registry() {
+    let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
+    let syscall = RoomSyscall {
+        workers: Arc::new(Mutex::new(HashMap::new())),
+        cleanup_tx,
+        cleanup_rx: Arc::new(Mutex::new(cleanup_rx)),
+    };
+    let (worker_tx, _worker_rx) = mpsc::channel(1);
+
+    syscall
+        .workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert("general".to_string(), worker_tx);
+
+    syscall.cleanup_tx.send("general".to_string()).unwrap();
+    syscall.drain_cleanup();
+
+    assert!(
+        syscall
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
 }

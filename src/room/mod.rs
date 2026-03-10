@@ -2,10 +2,10 @@
 //!
 //! ARCHITECTURE
 //! ============
-//! `RoomSyscall` implements `muninn_kernel::Syscall` for the `"room"` prefix.
-//! All room state lives inside this single task (no shared memory, no mutex).
-//! Per-room `message` requests are spawned as tasks so concurrent rooms make
-//! overlapping LLM calls without blocking the state loop.
+//! `RoomSyscall` routes requests to one worker task per room. Each worker owns
+//! that room's mutable state (actors + history) and processes requests
+//! sequentially from its mailbox. Different rooms can progress concurrently;
+//! same-room operations are serialized by the worker.
 //!
 //! VERBS
 //! =====
@@ -15,16 +15,16 @@
 //! - `room:list`    — stream active room names
 //! - `room:message` — user message → streaming ReAct loop → reply items
 
-mod handlers;
 mod message;
 pub mod state;
+mod worker;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 
 use muninn_kernel::frame::{ErrorCode, Frame};
 use muninn_kernel::pipe::Caller;
@@ -33,36 +33,132 @@ use muninn_kernel::syscall::Syscall;
 
 use crate::config::ConfigFile;
 use crate::error::RoomError;
-use crate::room::state::{HistoryKind, Room};
 use crate::types::{Data, Tool};
 
-// =============================================================================
-// CONSTRUCTION
-// =============================================================================
+use worker::{WorkerRequest, start_worker};
+
+const WORKER_CAPACITY: usize = 32;
+
+type WorkerMap = HashMap<String, mpsc::Sender<WorkerRequest>>;
 
 /// Kernel syscall handler for the `"room"` prefix.
 ///
-/// Room state is protected by a `Mutex` so `dispatch` (which takes `&self`)
-/// can mutate it. Each dispatch holds the lock only for synchronous state
-/// updates; the async LLM loop runs outside the lock.
+/// Top-level state tracks room worker mailboxes only. Each worker owns the
+/// mutable state for a single room.
 pub struct RoomSyscall {
-    rooms: Arc<Mutex<HashMap<String, Room>>>,
-    in_flight: Arc<Mutex<HashSet<String>>>,
+    workers: Arc<Mutex<WorkerMap>>,
+    cleanup_tx: mpsc::UnboundedSender<String>,
+    cleanup_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
 }
 
 impl RoomSyscall {
     #[must_use]
     pub fn new(_config: ConfigFile) -> Self {
+        let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
         Self {
-            rooms: Arc::new(Mutex::new(HashMap::new())),
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+            cleanup_tx,
+            cleanup_rx: Arc::new(Mutex::new(cleanup_rx)),
         }
     }
-}
 
-// =============================================================================
-// SYSCALL IMPL
-// =============================================================================
+    fn drain_cleanup(&self) {
+        let mut cleanup = self
+            .cleanup_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        while let Ok(room) = cleanup.try_recv() {
+            workers.remove(&room);
+        }
+    }
+
+    fn room_from_frame(frame: &Frame) -> Result<String, RoomError> {
+        frame
+            .data
+            .get("room")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| RoomError::Deserialize("missing 'room' field".into()))
+    }
+
+    fn worker_sender(
+        &self,
+        room: &str,
+        create: bool,
+    ) -> Result<mpsc::Sender<WorkerRequest>, RoomError> {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(sender) = workers.get(room) {
+            return Ok(sender.clone());
+        }
+
+        if !create {
+            return Err(RoomError::RoomNotFound {
+                room: room.to_string(),
+            });
+        }
+
+        let (tx, rx) = mpsc::channel(WORKER_CAPACITY);
+        start_worker(room.to_string(), rx, self.cleanup_tx.clone());
+        workers.insert(room.to_string(), tx.clone());
+        Ok(tx)
+    }
+
+    async fn dispatch_to_worker(
+        &self,
+        room: &str,
+        create: bool,
+        frame: &Frame,
+        tx: &FrameSender,
+        caller: &Caller,
+        cancel: CancellationToken,
+    ) -> Result<(), Box<dyn ErrorCode + Send>> {
+        let sender = self.worker_sender(room, create).map_err(box_err)?;
+        let request = WorkerRequest {
+            frame: frame.clone(),
+            tx: tx.clone(),
+            caller: caller.clone(),
+            cancel: cancel.clone(),
+        };
+
+        if sender.send(request).await.is_err() {
+            {
+                let mut workers = self
+                    .workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                workers.remove(room);
+            }
+
+            if !create {
+                return Err(box_err(RoomError::RoomNotFound {
+                    room: room.to_string(),
+                }));
+            }
+
+            let sender = self.worker_sender(room, true).map_err(box_err)?;
+            sender
+                .send(WorkerRequest {
+                    frame: frame.clone(),
+                    tx: tx.clone(),
+                    caller: caller.clone(),
+                    cancel,
+                })
+                .await
+                .map_err(|_| box_msg(format!("room worker closed while handling room '{room}'")))?;
+        }
+
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl Syscall for RoomSyscall {
@@ -75,53 +171,23 @@ impl Syscall for RoomSyscall {
         frame: &Frame,
         tx: &FrameSender,
         caller: &Caller,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), Box<dyn ErrorCode + Send>> {
+        self.drain_cleanup();
+
         match frame.verb() {
-            "join" => {
-                let result = {
-                    let mut rooms = lock_rooms(&self.rooms);
-                    handlers::handle_join(&mut rooms, frame)
-                };
-                result.map_err(box_err)?;
-                tx.send_done(frame)
-                    .await
-                    .map_err(|e| box_msg(e.to_string()))?;
-                Ok(())
-            }
-            "part" => {
-                let result = {
-                    let mut rooms = lock_rooms(&self.rooms);
-                    handlers::handle_part(&mut rooms, frame)
-                };
-                result.map_err(box_err)?;
-                tx.send_done(frame)
-                    .await
-                    .map_err(|e| box_msg(e.to_string()))?;
-                Ok(())
-            }
-            "history" => {
-                let items = {
-                    let rooms = lock_rooms(&self.rooms);
-                    handlers::handle_history(&rooms, frame)
-                };
-                let items = items.map_err(box_err)?;
-                for data in items {
-                    tx.send(frame.item(data))
-                        .await
-                        .map_err(|e| box_msg(e.to_string()))?;
-                }
-                tx.send_done(frame)
-                    .await
-                    .map_err(|e| box_msg(e.to_string()))?;
-                Ok(())
-            }
             "list" => {
-                let items = {
-                    let rooms = lock_rooms(&self.rooms);
-                    handlers::handle_list(&rooms)
+                let rooms: Vec<String> = {
+                    let workers = self
+                        .workers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    workers.keys().cloned().collect()
                 };
-                for data in items {
+
+                for room in rooms {
+                    let mut data = Data::new();
+                    data.insert("room".into(), room.into());
                     tx.send(frame.item(data))
                         .await
                         .map_err(|e| box_msg(e.to_string()))?;
@@ -131,137 +197,19 @@ impl Syscall for RoomSyscall {
                     .map_err(|e| box_msg(e.to_string()))?;
                 Ok(())
             }
-            "message" => handle_message(self, frame, tx, caller).await,
+            "join" | "message" => {
+                let room = Self::room_from_frame(frame).map_err(box_err)?;
+                self.dispatch_to_worker(&room, true, frame, tx, caller, cancel)
+                    .await
+            }
+            "part" | "history" => {
+                let room = Self::room_from_frame(frame).map_err(box_err)?;
+                self.dispatch_to_worker(&room, false, frame, tx, caller, cancel)
+                    .await
+            }
             other => Err(box_msg(format!("unknown room verb: {other}"))),
         }
     }
-}
-
-// =============================================================================
-// MESSAGE HANDLER
-// =============================================================================
-
-async fn handle_message(
-    syscall: &RoomSyscall,
-    frame: &Frame,
-    tx: &FrameSender,
-    caller: &Caller,
-) -> Result<(), Box<dyn ErrorCode + Send>> {
-    let room_name = str_field(&frame.data, "room").map_err(box_err)?;
-    let from = str_field(&frame.data, "from").map_err(box_err)?;
-    let content = str_field(&frame.data, "content").map_err(box_err)?;
-    let _guard =
-        RoomMessageGuard::acquire(Arc::clone(&syscall.in_flight), &room_name).map_err(box_err)?;
-
-    let allowed_prefixes: Vec<String> = frame
-        .data
-        .get("tool_prefixes")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let tools = parse_tools_field(&frame.data).map_err(box_err)?;
-
-    // Snapshot state needed for the loop — hold lock briefly.
-    let (actors, history) = {
-        let mut rooms = lock_rooms(&syscall.rooms);
-        let room = rooms.entry(room_name.clone()).or_default();
-
-        // Store the user message in history.
-        if let Err(e) = room.add_message(&from, &content, HistoryKind::User) {
-            return Err(box_err(e));
-        }
-
-        let actors = room.actors.clone();
-        let history = room.history.clone();
-        (actors, history)
-    };
-
-    let rooms = Arc::clone(&syscall.rooms);
-    let frame_clone = frame.clone();
-    let caller_clone = caller.clone();
-    let tx_clone = tx.clone();
-
-    // Spawn actors concurrently, collecting replies.
-    let mut join_handles = Vec::new();
-    for actor in &actors {
-        let actor_name = actor.name.clone();
-        let actor_config = actor.config.clone();
-        let room_name_clone = room_name.clone();
-        let history_clone = history.clone();
-        let tools_clone = tools.clone();
-        let allowed_clone = allowed_prefixes.clone();
-        let actors_clone = actors.clone();
-        let caller_c = caller_clone.clone();
-        let tx_c = tx_clone.clone();
-        let frame_c = frame_clone.clone();
-
-        let handle = tokio::spawn(async move {
-            message::run_actor_loop(
-                &caller_c,
-                &actor_config,
-                history_clone,
-                &tools_clone,
-                &allowed_clone,
-                &room_name_clone,
-                &actor_name,
-                &actors_clone,
-                &tx_c,
-                &frame_c,
-            )
-            .await
-            .map(|reply| (actor_name, reply))
-        });
-        join_handles.push(handle);
-    }
-
-    // Collect replies and store in history.
-    for handle in join_handles {
-        let result = handle.await.map_err(|e| box_msg(e.to_string()))?;
-        match result {
-            Ok((actor_name, reply)) => {
-                let mut rooms = lock_rooms(&rooms);
-                if let Some(room) = rooms.get_mut(&room_name) {
-                    if let Err(err) = room.add_message(&actor_name, &reply, HistoryKind::Assistant)
-                    {
-                        warn!(error = %err, actor = %actor_name, room = %room_name, "room: failed to persist assistant reply");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "room: actor loop error");
-            }
-        }
-    }
-
-    tx_clone
-        .send_done(&frame_clone)
-        .await
-        .map_err(|e| box_msg(e.to_string()))?;
-    Ok(())
-}
-
-// =============================================================================
-// HELPERS
-// =============================================================================
-
-fn lock_rooms(
-    rooms: &Arc<Mutex<HashMap<String, Room>>>,
-) -> std::sync::MutexGuard<'_, HashMap<String, Room>> {
-    rooms
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn str_field(data: &Data, key: &str) -> Result<String, RoomError> {
-    data.get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| RoomError::Deserialize(format!("missing '{key}' field")))
 }
 
 fn parse_tools_field(data: &Data) -> Result<Vec<Tool>, RoomError> {
@@ -273,37 +221,11 @@ fn parse_tools_field(data: &Data) -> Result<Vec<Tool>, RoomError> {
         .map_err(|e| RoomError::Deserialize(format!("invalid 'tools' field: {e}")))
 }
 
-struct RoomMessageGuard {
-    in_flight: Arc<Mutex<HashSet<String>>>,
-    room: String,
-}
-
-impl RoomMessageGuard {
-    fn acquire(in_flight: Arc<Mutex<HashSet<String>>>, room: &str) -> Result<Self, RoomError> {
-        let room = room.to_string();
-        let inserted = {
-            let mut guard = in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.insert(room.clone())
-        };
-
-        if !inserted {
-            return Err(RoomError::RoomBusy { room });
-        }
-
-        Ok(Self { in_flight, room })
-    }
-}
-
-impl Drop for RoomMessageGuard {
-    fn drop(&mut self) {
-        let mut guard = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(&self.room);
-    }
+fn str_field(data: &Data, key: &str) -> Result<String, RoomError> {
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| RoomError::Deserialize(format!("missing '{key}' field")))
 }
 
 fn box_err(e: impl ErrorCode + Send + 'static) -> Box<dyn ErrorCode + Send> {
