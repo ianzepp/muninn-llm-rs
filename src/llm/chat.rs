@@ -146,7 +146,7 @@ pub(crate) async fn handle_chat(
         room,
         description: "",
         notes: "",
-        memory: "",
+        memory: req.memory.as_deref().unwrap_or(""),
         traits: &config.traits,
     });
 

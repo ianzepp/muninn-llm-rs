@@ -60,6 +60,19 @@ pub struct HistoryEntry {
     pub kind: HistoryKind,
 }
 
+/// A compact persisted summary of a tool outcome from a completed turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutcomeRecord {
+    pub actor: String,
+    pub syscall: String,
+    pub ok: bool,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub ts: i64,
+    pub turn_id: u64,
+}
+
 // =============================================================================
 // ROOM
 // =============================================================================
@@ -68,6 +81,7 @@ pub struct HistoryEntry {
 pub struct Room {
     pub actors: Vec<Actor>,
     pub history: Vec<HistoryEntry>,
+    pub tool_outcomes: Vec<ToolOutcomeRecord>,
     next_id: u64,
 }
 
@@ -77,6 +91,7 @@ impl Room {
         Self {
             actors: Vec::new(),
             history: Vec::new(),
+            tool_outcomes: Vec::new(),
             next_id: 1,
         }
     }
@@ -111,6 +126,40 @@ impl Room {
             let remove = self.history.len() - max;
             self.history.drain(..remove);
         }
+    }
+
+    pub fn add_tool_outcome(&mut self, outcome: ToolOutcomeRecord) {
+        self.tool_outcomes.push(outcome);
+    }
+
+    #[must_use]
+    pub fn render_recent_tool_outcomes(&self, limit: usize) -> String {
+        if limit == 0 || self.tool_outcomes.is_empty() {
+            return String::new();
+        }
+
+        self.tool_outcomes
+            .iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|outcome| {
+                let status = if outcome.ok { "ok" } else { "error" };
+                let mut line = format!(
+                    "- turn {} | actor {} | {} | {} | {}",
+                    outcome.turn_id, outcome.actor, outcome.syscall, status, outcome.summary
+                );
+                if let Some(code) = &outcome.error_code {
+                    line.push_str(" (code: ");
+                    line.push_str(code);
+                    line.push(')');
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 

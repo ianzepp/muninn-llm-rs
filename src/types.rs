@@ -135,6 +135,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub context: Vec<Message>,
     #[serde(default)]
+    pub memory: Option<String>,
+    #[serde(default)]
     pub tools: Option<Vec<Tool>>,
 }
 

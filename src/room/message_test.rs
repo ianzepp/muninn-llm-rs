@@ -107,3 +107,21 @@ async fn collect_chat_deltas_requires_terminal_frame() {
     assert!(matches!(err, LlmError::InternalCall(_)));
     assert!(err.to_string().contains("terminal frame"));
 }
+
+#[test]
+fn build_chat_frame_includes_memory_when_present() {
+    let frame = build_chat_frame(
+        "default",
+        &[],
+        &[],
+        "Recent tool outcomes:\n- turn 3 | actor bot | exec:run | error | permission denied",
+        &[],
+        "general",
+    )
+    .unwrap();
+
+    assert_eq!(
+        frame.data.get("memory").and_then(|v| v.as_str()),
+        Some("Recent tool outcomes:\n- turn 3 | actor bot | exec:run | error | permission denied")
+    );
+}

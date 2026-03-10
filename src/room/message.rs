@@ -51,15 +51,17 @@ pub async fn run_actor_loop(
     room: &str,
     actor_name: &str,
     actors: &[Actor],
+    memory: &str,
     upstream: &FrameSender,
     req_frame: &Frame,
-) -> Result<String, LlmError> {
+) -> Result<ActorLoopResult, LlmError> {
     let mut context: Vec<Message> = Vec::new();
+    let mut tool_outcomes = Vec::new();
 
     for round in 0..MAX_TOOL_ROUNDS {
         info!(config = %config, round = round + 1, history = history.len(), context = context.len(), "room: llm round");
 
-        let chat_frame = build_chat_frame(config, &history, &context, tools, room)?;
+        let chat_frame = build_chat_frame(config, &history, &context, memory, tools, room)?;
         let mut stream = caller
             .call(chat_frame)
             .await
@@ -82,7 +84,10 @@ pub async fn run_actor_loop(
                 let text = extract_text(&blocks);
                 emit_chat(caller, room, actor_name, &text).await;
                 emit_reply(upstream, req_frame, room, actor_name, &text).await;
-                return Ok(text);
+                return Ok(ActorLoopResult {
+                    reply: text,
+                    tool_outcomes,
+                });
             }
             "tool_use" => {
                 // Append assistant turn to context.
@@ -92,14 +97,15 @@ pub async fn run_actor_loop(
                 });
 
                 // Dispatch tool calls and collect results.
-                let tool_results =
+                let dispatch =
                     dispatch_tools(caller, &blocks, actors, tools, allowed_prefixes, room).await?;
-                info!(config = %config, round = round + 1, results = tool_results.len(), "room: tool dispatch done");
+                info!(config = %config, round = round + 1, results = dispatch.blocks.len(), "room: tool dispatch done");
+                tool_outcomes.extend(dispatch.outcomes);
 
                 // Append user turn with tool results.
                 context.push(Message {
                     role: "user".to_string(),
-                    content: Content::Blocks(tool_results),
+                    content: Content::Blocks(dispatch.blocks),
                 });
             }
             other => {
@@ -127,20 +133,30 @@ async fn dispatch_tools(
     tools: &[Tool],
     allowed_prefixes: &[String],
     room: &str,
-) -> Result<Vec<ContentBlock>, LlmError> {
-    let mut results = Vec::new();
+) -> Result<ToolDispatchResults, LlmError> {
+    let mut result_blocks = Vec::new();
+    let mut outcomes = Vec::new();
     for block in blocks {
         let ContentBlock::ToolUse { id, input, .. } = block else {
             continue;
         };
         let outcome = dispatch_one_tool(caller, input, actors, tools, allowed_prefixes, room).await;
-        results.push(ContentBlock::ToolResult {
+        result_blocks.push(ContentBlock::ToolResult {
             tool_use_id: id.clone(),
             content: outcome.content,
             is_error: Some(outcome.is_error),
         });
+        outcomes.push(ToolOutcomeSummary {
+            syscall: outcome.syscall,
+            ok: !outcome.is_error,
+            summary: outcome.summary,
+            error_code: outcome.error_code,
+        });
     }
-    Ok(results)
+    Ok(ToolDispatchResults {
+        blocks: result_blocks,
+        outcomes,
+    })
 }
 
 async fn dispatch_one_tool(
@@ -152,7 +168,7 @@ async fn dispatch_one_tool(
     room: &str,
 ) -> ToolOutcome {
     let Some(syscall) = input.get("syscall").and_then(|v| v.as_str()) else {
-        return ToolOutcome::error("tool_use input missing 'syscall' field");
+        return ToolOutcome::error("<missing>", "tool_use input missing 'syscall' field");
     };
     info!(syscall, "room: tool call");
 
@@ -166,9 +182,10 @@ async fn dispatch_one_tool(
 
     // Block room:* to prevent deadlock, except read-only above.
     if syscall.starts_with("room:") && !room_read_ok {
-        return ToolOutcome::error(format!(
-            "forbidden tool syscall (would deadlock): {syscall}"
-        ));
+        return ToolOutcome::error(
+            syscall,
+            format!("forbidden tool syscall (would deadlock): {syscall}"),
+        );
     }
 
     // Allowlist check.
@@ -177,7 +194,7 @@ async fn dispatch_one_tool(
             .iter()
             .any(|p| syscall.starts_with(p.as_str()))
     {
-        return ToolOutcome::error(format!("forbidden tool syscall: {syscall}"));
+        return ToolOutcome::error(syscall, format!("forbidden tool syscall: {syscall}"));
     }
 
     let tool_data: Data = match input.get("data").and_then(|v| v.as_object()) {
@@ -190,7 +207,7 @@ async fn dispatch_one_tool(
 
     let stream = match caller.call(req).await {
         Ok(s) => s,
-        Err(e) => return ToolOutcome::error(format!("pipe closed: {e}")),
+        Err(e) => return ToolOutcome::error(syscall, format!("pipe closed: {e}")),
     };
 
     let responses = stream.collect().await;
@@ -200,7 +217,12 @@ async fn dispatch_one_tool(
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("syscall failed");
-        return ToolOutcome::error(msg.to_string());
+        let error_code = err
+            .data
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        return ToolOutcome::error_with_code(syscall, msg.to_string(), error_code);
     }
 
     let items: Vec<String> = responses
@@ -215,8 +237,11 @@ async fn dispatch_one_tool(
         items.join("\n")
     };
     ToolOutcome {
+        syscall: syscall.to_string(),
+        summary: summarize_tool_content(&content, false),
         content,
         is_error: false,
+        error_code: None,
     }
 }
 
@@ -230,14 +255,17 @@ async fn dispatch_delegate(
 ) -> ToolOutcome {
     let data = input.get("data").unwrap_or(&serde_json::Value::Null);
     let Some(role) = data.get("role").and_then(|v| v.as_str()) else {
-        return ToolOutcome::error("room:delegate missing 'role' in data");
+        return ToolOutcome::error("room:delegate", "room:delegate missing 'role' in data");
     };
     let Some(prompt) = data.get("prompt").and_then(|v| v.as_str()) else {
-        return ToolOutcome::error("room:delegate missing 'prompt' in data");
+        return ToolOutcome::error("room:delegate", "room:delegate missing 'prompt' in data");
     };
 
     let Some(delegate) = actors.iter().find(|a| a.config == role) else {
-        return ToolOutcome::error(format!("no actor with role '{role}' in room"));
+        return ToolOutcome::error(
+            "room:delegate",
+            format!("no actor with role '{role}' in room"),
+        );
     };
 
     info!(role = %role, delegate = %delegate.name, "room: delegating");
@@ -265,16 +293,20 @@ async fn dispatch_delegate(
         room,
         &delegate.name,
         actors,
+        "",
         &sink,
         &placeholder_frame,
     ))
     .await
     {
-        Ok(reply) => ToolOutcome {
-            content: reply,
+        Ok(result) => ToolOutcome {
+            syscall: "room:delegate".to_string(),
+            content: result.reply.clone(),
             is_error: false,
+            summary: summarize_tool_content(&result.reply, false),
+            error_code: None,
         },
-        Err(e) => ToolOutcome::error(format!("delegate '{role}' failed: {e}")),
+        Err(e) => ToolOutcome::error("room:delegate", format!("delegate '{role}' failed: {e}")),
     }
 }
 
@@ -282,18 +314,78 @@ async fn dispatch_delegate(
 // HELPERS
 // =============================================================================
 
+pub struct ActorLoopResult {
+    pub reply: String,
+    pub tool_outcomes: Vec<ToolOutcomeSummary>,
+}
+
+struct ToolDispatchResults {
+    blocks: Vec<ContentBlock>,
+    outcomes: Vec<ToolOutcomeSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolOutcomeSummary {
+    pub syscall: String,
+    pub ok: bool,
+    pub summary: String,
+    pub error_code: Option<String>,
+}
+
 struct ToolOutcome {
+    syscall: String,
     content: String,
     is_error: bool,
+    summary: String,
+    error_code: Option<String>,
 }
 
 impl ToolOutcome {
-    fn error(msg: impl Into<String>) -> Self {
+    fn error(syscall: impl Into<String>, msg: impl Into<String>) -> Self {
+        let summary = msg.into();
         Self {
-            content: format!("error: {}", msg.into()),
+            syscall: syscall.into(),
+            content: format!("error: {summary}"),
             is_error: true,
+            summary: summarize_tool_content(&summary, true),
+            error_code: None,
         }
     }
+
+    fn error_with_code(
+        syscall: impl Into<String>,
+        msg: impl Into<String>,
+        error_code: Option<String>,
+    ) -> Self {
+        let summary = msg.into();
+        Self {
+            syscall: syscall.into(),
+            content: format!("error: {summary}"),
+            is_error: true,
+            summary: summarize_tool_content(&summary, true),
+            error_code,
+        }
+    }
+}
+
+fn summarize_tool_content(content: &str, is_error: bool) -> String {
+    const MAX_SUMMARY_LEN: usize = 160;
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return if is_error {
+            "tool failed".to_string()
+        } else {
+            "tool succeeded".to_string()
+        };
+    }
+
+    let mut summary = trimmed.to_string();
+    if summary.len() > MAX_SUMMARY_LEN {
+        summary.truncate(MAX_SUMMARY_LEN);
+        summary.push_str("...");
+    }
+    summary
 }
 
 fn extract_text(blocks: &[ContentBlock]) -> String {
@@ -447,6 +539,7 @@ fn build_chat_frame(
     config: &str,
     history: &[HistoryEntry],
     context: &[Message],
+    memory: &str,
     tools: &[Tool],
     room: &str,
 ) -> Result<Frame, LlmError> {
@@ -462,6 +555,9 @@ fn build_chat_frame(
         let ctx_val =
             serde_json::to_value(context).map_err(|e| LlmError::Serialize(e.to_string()))?;
         data.insert("context".into(), ctx_val);
+    }
+    if !memory.trim().is_empty() {
+        data.insert("memory".into(), memory.trim().into());
     }
     if !tools.is_empty() {
         let tools_val =

@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::history_to_messages;
+use crate::prompt_bundle::{PromptContext, build_system_prompt};
 use crate::room::state::{HistoryEntry, HistoryKind};
 use crate::types::{Content, ContentBlock, Message};
 
@@ -67,4 +68,21 @@ fn history_to_messages_keeps_tool_followup_adjacent() {
     assert!(
         matches!(&messages[2].content, Content::Blocks(blocks) if matches!(&blocks[0], ContentBlock::ToolResult { .. }))
     );
+}
+
+#[test]
+fn system_prompt_includes_request_memory_when_present() {
+    let prompt = build_system_prompt(&PromptContext {
+        config: "default",
+        self_prompt: "Assistant.",
+        tools: None,
+        room: "general",
+        description: "",
+        notes: "",
+        memory: "Prior tool outcome: exec:run failed with permission denied.",
+        traits: &[],
+    });
+
+    assert!(prompt.contains("Memory"));
+    assert!(prompt.contains("permission denied"));
 }

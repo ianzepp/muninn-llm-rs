@@ -8,7 +8,7 @@ use muninn_kernel::sender::FrameSender;
 
 use crate::error::{LlmError, RoomError};
 use crate::room::message;
-use crate::room::state::{Actor, HistoryKind, Room};
+use crate::room::state::{Actor, HistoryKind, Room, ToolOutcomeRecord};
 use crate::types::Data;
 
 use super::{parse_tools_field, str_field};
@@ -71,7 +71,12 @@ impl RoomWorker {
                 false
             }
             other => {
-                send_error(&request.tx, &request.frame, format!("unknown room verb: {other}")).await;
+                send_error(
+                    &request.tx,
+                    &request.frame,
+                    format!("unknown room verb: {other}"),
+                )
+                .await;
                 false
             }
         }
@@ -225,9 +230,11 @@ impl RoomWorker {
             send_error_from(&request.tx, frame, &err).await;
             return;
         }
+        let turn_id = self.room.history.last().map_or(0, |entry| entry.id);
 
         let actors = self.room.actors.clone();
         let history = self.room.history.clone();
+        let memory = self.room.render_recent_tool_outcomes(8);
 
         let mut actor_tasks = JoinSet::new();
         for actor in &actors {
@@ -238,6 +245,7 @@ impl RoomWorker {
             let tools_clone = tools.clone();
             let allowed_clone = allowed_prefixes.clone();
             let actors_clone = actors.clone();
+            let memory_clone = memory.clone();
             let caller = request.caller.clone();
             let tx = request.tx.clone();
             let frame = request.frame.clone();
@@ -255,23 +263,35 @@ impl RoomWorker {
                         &room_name,
                         &actor_name,
                         &actors_clone,
+                        &memory_clone,
                         &tx,
                         &frame,
                     ) => result,
                 }
-                .map(|reply| (actor_name, reply))
+                .map(|result| (actor_name, result))
             });
         }
 
         let mut cancelled = false;
         while let Some(result) = actor_tasks.join_next().await {
             match result {
-                Ok(Ok((actor_name, reply))) => {
+                Ok(Ok((actor_name, result))) => {
                     if let Err(err) =
                         self.room
-                            .add_message(&actor_name, &reply, HistoryKind::Assistant)
+                            .add_message(&actor_name, &result.reply, HistoryKind::Assistant)
                     {
                         warn!(error = %err, actor = %actor_name, room = %self.room_name, "room: failed to persist assistant reply");
+                    }
+                    for outcome in result.tool_outcomes {
+                        self.room.add_tool_outcome(ToolOutcomeRecord {
+                            actor: actor_name.clone(),
+                            syscall: outcome.syscall,
+                            ok: outcome.ok,
+                            summary: outcome.summary,
+                            error_code: outcome.error_code,
+                            ts: self.room.history.last().map_or(0, |entry| entry.ts),
+                            turn_id,
+                        });
                     }
                 }
                 Ok(Err(LlmError::InternalCall(msg))) if msg == "room:message cancelled" => {
